@@ -10,6 +10,7 @@
 #include "grove_bme680.h"
 #include "sd_logger.h"
 #include "board_pins.h"
+#include "rgb_led.h"
 
 // CONFIGURATION
 
@@ -104,16 +105,8 @@ static void appui_long_vert(void);       // action à effectuer lors d'un appui 
 
 static void initialiser_mode_demarrage(void);  // initialisation du mode au démarrage
 static void changer_mode(mode_fonctionnement_t nouveau_mode);  // changement de mode
-static void afficher_couleur_mode(void);  // TODO : affichage de la couleur de la LED selon le mode actif
+static void afficher_couleur_mode(void);  // affichage de la couleur de la LED selon le mode actif
 static void gestion_mode(void); // gestion des modes (délai de configuration, acquisitions, etc.)
-
-static void    initialiser_systeme(void);           // capteurs, RTC, GPS, carte SD, CONFIG.TXT, revision_suivante
-static uint8_t acquerir_mesures(uint8_t lire_gps);  // capteurs + RTC (+ GPS si lire_gps) , retourne 1 si horodatage valide
-static void    enregistrer_sd(void);                // ligne de mesure, changement de date, archivage, écriture
-static void    traiter_commande(void);              // lecture et exécution d'une commande console
-static void    signaler_erreur(code_erreur_t code); // active le bit de l'erreur dans erreurs_actives
-static void    effacer_erreur(code_erreur_t code);  // efface le bit de l'erreur dans erreurs_actives
-static void    mettre_a_jour_led(void);             // TODO : erreur prioritaire en clignotement, sinon couleur du mode
 
 // TODO
 static void    initialiser_systeme(void);           // capteurs, RTC, GPS, carte SD, CONFIG.TXT, revision_suivante
@@ -334,6 +327,20 @@ static void appui_long_vert(void)
     }
 }
 
+// COULEUR DE LA LED SELON LE MODE
+
+static void afficher_couleur_mode(void)
+{
+    switch (mode_actuel)
+    {
+        case MODE_STANDARD:      RGB_SetColor(RGB_GREEN);  break; // vert continu
+        case MODE_CONFIGURATION: RGB_SetColor(RGB_YELLOW); break; // jaune continu
+        case MODE_ECONOMIQUE:    RGB_SetColor(RGB_BLUE);   break; // bleu continu
+        case MODE_MAINTENANCE:   RGB_SetColor(RGB_ORANGE); break; // orange continu
+        default:                 RGB_Off();                break;
+    }
+}
+
 // CHANGEMENT DE MODE
 
 static void changer_mode(mode_fonctionnement_t nouveau_mode)
@@ -367,6 +374,8 @@ static void changer_mode(mode_fonctionnement_t nouveau_mode)
         default:
             break;
     }
+
+    afficher_couleur_mode(); // mise à jour de la couleur de la LED
 }
 
 // INITIALISATION DU MODE AU DEMARRAGE
@@ -386,6 +395,7 @@ static void initialiser_mode_demarrage(void)
     }
 
     mode_precedent = MODE_STANDARD;
+    afficher_couleur_mode();
 }
 
 // GESTION DES MODES
@@ -410,6 +420,7 @@ static void gestion_mode(void)
 int main(void)
 {
     Global_Init();
+    RGB_Init();
     boutons_init();
 
     initialiser_mode_demarrage();
