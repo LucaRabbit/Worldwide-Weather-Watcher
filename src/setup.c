@@ -185,14 +185,19 @@ static void MX_USART2_UART_Init(void)
     }
 }
 
-
+/*
+ * @brief Initialisation globale du système
+ */
 void Global_Init(void)
 {
-    HAL_Init();
-    SystemClock_Config();
+    HAL_Init(); // Initialisation de la HAL
+    SystemClock_Config(); // Configuration de l'horloge système
 
-    MX_I2C1_Init();
-    MX_SPI1_Init();
+    MX_GPIO_Init(); // Initialisation des GPIOs
+    MX_ADC1_Init(); // Initialisation de l'ADC pour le capteur de luminosité
+    MX_I2C1_Init(); // Initialisation de l'I2C pour le RTC
+    MX_SPI1_Init(); // Initialisation du SPI pour la carte SD
+    MX_USART1_UART_Init(); // Initialisation de l'UART pour le GPS
+    MX_USART2_UART_Init(); // Initialisation de l'UART pour le terminal série
 
-    MX_USART2_UART_Init();
 }
