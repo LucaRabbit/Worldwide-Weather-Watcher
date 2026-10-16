@@ -45,6 +45,8 @@
 #define PRESSURE_MIN_DEFAUT   850U   // seuil bas de cohérence (hPa)
 #define PRESSURE_MAX_DEFAUT   1080U  // seuil haut de cohérence (hPa)
 
+#define PERIODE_TEST_MS     2000U        // période d'affichage des mesures de test (ms)
+
 // CODES D'ERREUR (rangés par priorité croissante : 1 bit par code dans erreurs_actives)
 
 typedef enum
@@ -221,6 +223,26 @@ static void gestion_mode(void)
 
 }
 
+// TEST DES CAPTEURS (affichage port série)
+
+static void test_capteurs(void)
+{
+    static uint32_t dernier_affichage = 0U;
+
+    if ((HAL_GetTick() - dernier_affichage) < PERIODE_TEST_MS)
+    {
+        return;
+    }
+    dernier_affichage = HAL_GetTick();
+
+    uint16_t lumiere = GroveLight_ReadRaw();
+
+    if (lumiere == 0xFFFFU)
+        printf("[LUM] erreur de lecture ADC\r\n");
+    else
+        printf("[LUM] %u / 4095\r\n", lumiere);
+}
+
 // PROGRAMME PRINCIPAL
 
 int main(void)
@@ -228,6 +250,7 @@ int main(void)
     Global_Init();
     GroveRGB_Init();
     GroveButton_Init();
+    GroveLight_Init();
 
     initialiser_mode_demarrage();
 
@@ -247,6 +270,6 @@ int main(void)
 
         gestion_mode();
 
-        // TODO : traitements
+        test_capteurs();
     }
 }
