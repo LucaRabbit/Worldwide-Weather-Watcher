@@ -16,7 +16,7 @@
 #define RGB_GREEN    0U, 255U,   0U
 #define RGB_BLUE     0U,   0U, 255U
 #define RGB_YELLOW 255U, 255U,   0U
-#define RGB_ORANGE 255U, 128U,   0U
+#define RGB_ORANGE 255U,  94U,   0U
 
 // Configure les GPIO et éteint la LED
 void RGB_Init(void);
