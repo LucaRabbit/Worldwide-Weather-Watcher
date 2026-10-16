@@ -10,7 +10,6 @@
 #include "grove_bme680.h"
 #include "sd_logger.h"
 #include "board_pins.h"
-#include "rgb_led.h"
 
 // CONFIGURATION
 
@@ -133,7 +132,7 @@ static void boutons_init(void)
 
     // Bouton rouge
     gpio_init.Pin = BUTTON1_PIN;
-    HAL_GPIO_Init(BUTTON1_PORT, &gpio_init); // 
+    HAL_GPIO_Init(BUTTON1_PORT, &gpio_init);
 
     // Bouton vert
     gpio_init.Pin = BUTTON2_PIN;
@@ -333,11 +332,11 @@ static void afficher_couleur_mode(void)
 {
     switch (mode_actuel)
     {
-        case MODE_STANDARD:      RGB_SetColor(RGB_GREEN);  break; // vert continu
-        case MODE_CONFIGURATION: RGB_SetColor(RGB_YELLOW); break; // jaune continu
-        case MODE_ECONOMIQUE:    RGB_SetColor(RGB_BLUE);   break; // bleu continu
-        case MODE_MAINTENANCE:   RGB_SetColor(RGB_ORANGE); break; // orange continu
-        default:                 RGB_Off();                break;
+        case MODE_STANDARD:      GroveRGB_SetColor(GROVE_RGB_GREEN);  break; // vert continu
+        case MODE_CONFIGURATION: GroveRGB_SetColor(GROVE_RGB_YELLOW); break; // jaune continu
+        case MODE_ECONOMIQUE:    GroveRGB_SetColor(GROVE_RGB_BLUE);   break; // bleu continu
+        case MODE_MAINTENANCE:   GroveRGB_SetColor(GROVE_RGB_ORANGE); break; // orange continu
+        default:                 GroveRGB_Off();                      break;
     }
 }
 
@@ -420,7 +419,7 @@ static void gestion_mode(void)
 int main(void)
 {
     Global_Init();
-    RGB_Init();
+    GroveRGB_Init();
     boutons_init();
 
     initialiser_mode_demarrage();
