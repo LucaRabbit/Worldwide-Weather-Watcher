@@ -7,7 +7,7 @@
 #include "grove_light.h"
 #include "grove_rtc_ds1307.h"
 #include "grove_gps_air530z.h"
-#include "grove_bme680.h"
+#include "grove_bme280.h"
 #include "sd_logger.h"
 #include "board_pins.h"
 
@@ -235,12 +235,22 @@ static void test_capteurs(void)
     }
     dernier_affichage = HAL_GetTick();
 
+    // Test du capteur de lumière
     uint16_t lumiere = GroveLight_ReadRaw();
 
     if (lumiere == 0xFFFFU)
         printf("[LUM] erreur de lecture ADC\r\n");
     else
         printf("[LUM] %u / 4095\r\n", lumiere);
+
+    // Test du capteur BME280 (température, humidité, pression)
+    Env_Data env;
+
+    if (GroveBME280_ReadEnvironment(&env))
+        printf("[BME280] T=%.2f C  H=%.1f %%  P=%.2f hPa\r\n",
+               env.temperature_c, env.humidity_percent, env.pressure_hpa);
+    else
+        printf("[BME280] erreur de lecture\r\n");
 }
 
 // PROGRAMME PRINCIPAL
@@ -251,6 +261,7 @@ int main(void)
     GroveRGB_Init();
     GroveButton_Init();
     GroveLight_Init();
+    GroveBME280_Init();
 
     initialiser_mode_demarrage();
 
