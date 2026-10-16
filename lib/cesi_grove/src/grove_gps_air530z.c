@@ -100,12 +100,17 @@ bool GroveGPS_ReadGGA(GPS_Data *gps, unsigned int timeout_ms)
 
         char *fields[16] = {0};
         int i = 0;
-        char *token = strtok(copy, ",");
+        char *p = copy;
 
-        while (token != 0 && i < 16)
+        fields[i++] = p;
+        while (*p != '\0' && i < 16)
         {
-            fields[i++] = token;
-            token = strtok(0, ",");
+            if (*p == ',')
+            {
+                *p = '\0';
+                fields[i++] = p + 1;
+            }
+            p++;
         }
 
         if (i < 8) return false;

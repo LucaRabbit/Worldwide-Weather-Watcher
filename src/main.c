@@ -251,6 +251,24 @@ static void test_capteurs(void)
                env.temperature_c, env.humidity_percent, env.pressure_hpa);
     else
         printf("[BME280] erreur de lecture\r\n");
+
+    // Test du GPS Air530Z (trame GGA)
+    GPS_Data gps = {0};
+    
+    if (GroveGPS_ReadGGA(&gps, 1500U))
+    {
+        printf("[GPS] %s\r\n", gps.raw_sentence);
+
+        if (gps.valid)
+            printf("[GPS] lat=%.6f lon=%.6f sats=%u\r\n",
+                   gps.latitude, gps.longitude, gps.satellites);
+        else
+            printf("[GPS] pas de fix (sats=%u)\r\n", gps.satellites);
+    }
+    else
+    {
+        printf("[GPS] aucune trame GGA recue\r\n");
+    }
 }
 
 // PROGRAMME PRINCIPAL
@@ -262,6 +280,7 @@ int main(void)
     GroveButton_Init();
     GroveLight_Init();
     GroveBME280_Init();
+    GroveGPS_Init();
 
     initialiser_mode_demarrage();
 
