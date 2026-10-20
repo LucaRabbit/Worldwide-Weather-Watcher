@@ -1,0 +1,10 @@
+{
+  "name": "fatfs",
+  "version": "0.16.2",
+  "description": "FatFs R0.16 patch 2 (ChaN) - système de fichiers FAT",
+  "build": {
+    "includeDir": "include",
+    "srcDir": "src",
+    "libArchive": false
+  }
+}

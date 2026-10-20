@@ -744,6 +744,13 @@ int main(void)
 {
     initialiser_systeme();
 
+    printf("[SD] %s\r\n", SDLogger_EstPrete() ? "carte montee" : "carte absente ou non FAT");
+    printf("[SD] ecriture : %d (0 = OK)\r\n", SDLogger_AjouterLigne("TEST.LOG", "Bonjour WWW"));
+
+    uint32_t ko;
+    if (SDLogger_EspaceLibre(&ko))
+        printf("[SD] %lu kio libres\r\n", (unsigned long)ko);
+
     initialiser_mode_demarrage();
 
     while (1)
