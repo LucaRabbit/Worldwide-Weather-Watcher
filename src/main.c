@@ -378,7 +378,7 @@ static uint8_t acquerir_mesures(uint8_t lire_gps)
     if (params.lumin)
     {
         uint16_t lumiere = GroveLight_ReadRaw(); // 0-1023 (ADC 10 bits)
-        bool reponse = (lumiere != LUMIN_ERREUR);
+        bool reponse = (lumiere != LUMIN_ERREUR) && GroveLight_EstConnecte();
  
         compter_reponse(CAPT_LUMINOSITE, reponse);
  
