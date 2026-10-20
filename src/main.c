@@ -29,7 +29,7 @@
 // VALEURS PAR DÉFAUT DES PARAMÈTRES (modifiables en mode configuration)
 // U = unsigned int
 
-#define LOG_INTERVAL_DEFAUT   10U    // intervalle entre deux mesures (min)
+#define LOG_INTERVAL_DEFAUT   10000U    // intervalle entre deux mesures (min)
 #define FILE_MAX_SIZE_DEFAUT  2048U  // taille max d'un fichier de log (octets)
 #define TIMEOUT_DEFAUT        30U    // abandon de l'acquisition d'un capteur (s)
 #define LUMIN_DEFAUT          1U     // capteur de luminosité activé
@@ -48,6 +48,8 @@
 #define GPS_ATTENTE_MS      2000U        // attente max d'une trame GGA (le GPS en émet une par seconde)
 #define LUMIN_ERREUR        0xFFFFU      // valeur renvoyée par GroveLight_ReadRaw() en cas d'échec
 #define PERIODE_MAINTENANCE_MS  2000U    // rafraîchissement de l'affichage en maintenance (ms)
+
+#define TAILLE_MOYENNE      5U           // nombre de mesures dans la moyenne glissante
 
 // CODES D'ERREUR (rangés par priorité croissante : 1 bit par code dans erreurs_actives)
 
@@ -80,6 +82,15 @@ typedef enum
     CAPT_PRESSION,
     CAPT_LUMINOSITE
 } capteur_t;
+
+// MOYENNE GLISSANTE (tampon circulaire des TAILLE_MOYENNE dernières mesures valides)
+ 
+typedef struct
+{
+    float   valeurs[TAILLE_MOYENNE];
+    uint8_t index;      // case où sera écrite la prochaine valeur
+    uint8_t nombre;     // nombre de valeurs présentes (< TAILLE_MOYENNE au démarrage)
+} moyenne_t;
 
 // PARAMÈTRES (valeurs par défaut au démarrage, modifiables plus tard en mode configuration)
  
@@ -146,6 +157,11 @@ static mesures_t mesures;                            // dernière acquisition (l
 static uint8_t   erreurs_actives = 0U;               // 1 bit par code_erreur_t
 static uint8_t   nb_timeouts[NB_CAPTEURS] = {0U};    // timeouts consécutifs par capteur
 static uint8_t   nb_timeouts_gps = 0U;               // timeouts consécutifs du GPS
+
+static moyenne_t moy_temperature;
+static moyenne_t moy_humidite;
+static moyenne_t moy_pression;
+static moyenne_t moy_luminosite;
 
 // Délai d'inactivité du mode configuration
 static uint32_t config_derniere_activite = 0U;
@@ -229,6 +245,43 @@ static void mode_configuration(void)
     }
 }
 
+// MOYENNE GLISSANTE
+ 
+// Ajoute une valeur (remplace la plus ancienne si le tampon est plein) et retourne la moyenne
+static float moyenne_ajouter(moyenne_t *m, float valeur)
+{
+    m->valeurs[m->index] = valeur;
+    m->index = (uint8_t)((m->index + 1U) % TAILLE_MOYENNE);
+ 
+    if (m->nombre < TAILLE_MOYENNE)
+    {
+        m->nombre++;
+    }
+ 
+    float somme = 0.0f;
+    for (uint8_t i = 0U; i < m->nombre; i++)
+    {
+        somme += m->valeurs[i];
+    }
+ 
+    return somme / (float)m->nombre;
+}
+ 
+// Vide le tampon (mesure NA, changement de mode)
+static void moyenne_vider(moyenne_t *m)
+{
+    m->index  = 0U;
+    m->nombre = 0U;
+}
+ 
+static void reinitialiser_moyennes(void)
+{
+    moyenne_vider(&moy_temperature);
+    moyenne_vider(&moy_humidite);
+    moyenne_vider(&moy_pression);
+    moyenne_vider(&moy_luminosite);
+}
+
 // GESTION DES ERREURS
  
 static void signaler_erreur(code_erreur_t code)
@@ -299,7 +352,7 @@ static uint8_t acquerir_mesures(uint8_t lire_gps)
                 }
                 else
                 {
-                    mesures.temperature_c  = env.temperature_c;
+                    mesures.temperature_c  = moyenne_ajouter(&moy_temperature, env.temperature_c);
                     mesures.temperature_ok = true;
                 }
             }
@@ -316,7 +369,7 @@ static uint8_t acquerir_mesures(uint8_t lire_gps)
  
             if (reponse && env.temperature_c >= params.hygr_mint && env.temperature_c <= params.hygr_maxt) // valeur rejetée si température hors plage
             {
-                mesures.humidite_pct = env.humidity_percent;
+                mesures.humidite_pct = moyenne_ajouter(&moy_humidite, env.humidity_percent);
                 mesures.humidite_ok  = true;
             }
         }
@@ -338,7 +391,7 @@ static uint8_t acquerir_mesures(uint8_t lire_gps)
                 }
                 else
                 {
-                    mesures.pression_hpa = env.pressure_hpa;
+                    mesures.pression_hpa = moyenne_ajouter(&moy_pression, env.pressure_hpa);
                     mesures.pression_ok  = true;
                 }
             }
@@ -365,7 +418,7 @@ static uint8_t acquerir_mesures(uint8_t lire_gps)
  
         if (reponse)
         {
-            mesures.luminosite    = lumiere;
+            mesures.luminosite    = moyenne_ajouter(&moy_luminosite, (float)lumiere);
             mesures.luminosite_ok = true;
         }
     }
@@ -373,6 +426,12 @@ static uint8_t acquerir_mesures(uint8_t lire_gps)
     {
         nb_timeouts[CAPT_LUMINOSITE] = 0U;
     }
+
+    // Mesure NA : historique interrompu, la moyenne repart de zéro
+    if (!mesures.temperature_ok) moyenne_vider(&moy_temperature);
+    if (!mesures.humidite_ok)    moyenne_vider(&moy_humidite);
+    if (!mesures.pression_ok)    moyenne_vider(&moy_pression);
+    if (!mesures.luminosite_ok)  moyenne_vider(&moy_luminosite);
  
     // 4. GPS (en mode économique : un cycle sur deux)
     if (lire_gps)
@@ -515,6 +574,7 @@ static void changer_mode(mode_fonctionnement_t nouveau_mode)
     }
 
     mode_actuel = nouveau_mode;
+    reinitialiser_moyennes(); // pas de mélange entre les mesures de deux modes
 
     switch (mode_actuel)
     {
