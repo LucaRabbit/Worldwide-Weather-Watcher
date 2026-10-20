@@ -3,7 +3,21 @@
 #include <string.h>
 #include <stdlib.h>
 
-UART_HandleTypeDef GPS_UART_HANDLE;
+#define GPS_TAILLE_TRAME  96U
+
+static UART_HandleTypeDef gps_uart;
+
+// Réception en cours (remplie octet par octet sous interruption)
+static uint8_t  octet_recu;
+static char     trame_en_cours[GPS_TAILLE_TRAME];
+static uint16_t longueur_en_cours = 0U;
+
+// Dernière trame GGA complète (écrite sous interruption, lue par le programme principal)
+static char              derniere_gga[GPS_TAILLE_TRAME];
+static volatile bool     gga_disponible = false;
+static volatile uint32_t gga_instant = 0U; // HAL_GetTick() à la réception
+
+// FONCTIONS INTERNES
 
 static double nmea_to_decimal(const char *value, const char hemisphere)
 {
@@ -20,109 +34,146 @@ static double nmea_to_decimal(const char *value, const char hemisphere)
     return decimal;
 }
 
+// Découpe et analyse une trame GGA :
+// $GPGGA,time,lat,N,lon,E,fix,sats,hdop,alt,M,...
+static bool analyser_gga(const char *trame, GPS_Data *gps)
+{
+    strncpy(gps->raw_sentence, trame, sizeof(gps->raw_sentence) - 1);
+    gps->raw_sentence[sizeof(gps->raw_sentence) - 1] = '\0';
+
+    char copy[GPS_TAILLE_TRAME];
+    strncpy(copy, trame, sizeof(copy));
+    copy[sizeof(copy) - 1] = '\0';
+
+    // Découpage manuel (strtok fusionnerait les champs vides d'une trame sans fix)
+    char *fields[16] = {0};
+    int i = 0;
+    char *p = copy;
+
+    fields[i++] = p;
+    while (*p != '\0' && i < 16)
+    {
+        if (*p == ',')
+        {
+            *p = '\0';
+            fields[i++] = p + 1;
+        }
+        p++;
+    }
+
+    if (i < 8) return false;
+
+    gps->latitude    = nmea_to_decimal(fields[2], fields[3][0] ? fields[3][0] : 'N');
+    gps->longitude   = nmea_to_decimal(fields[4], fields[5][0] ? fields[5][0] : 'E');
+    gps->fix_quality = (uint8_t)atoi(fields[6]);
+    gps->satellites  = (uint8_t)atoi(fields[7]);
+    gps->valid       = gps->fix_quality > 0;
+
+    return true;
+}
+
+// Traitement d'un octet reçu (appelé sous interruption)
+static void traiter_octet(uint8_t c)
+{
+    if (c == '\n')
+    {
+        trame_en_cours[longueur_en_cours] = '\0';
+
+        if (strncmp(trame_en_cours, "$GPGGA", 6) == 0 || strncmp(trame_en_cours, "$GNGGA", 6) == 0)
+        {
+            memcpy(derniere_gga, trame_en_cours, (size_t)longueur_en_cours + 1U);
+            gga_instant = HAL_GetTick();
+            gga_disponible = true;
+        }
+
+        longueur_en_cours = 0U;
+    }
+    else if (c == '$')
+    {
+        // Début de trame : on repart de zéro (resynchronisation après un octet perdu)
+        trame_en_cours[0] = '$';
+        longueur_en_cours = 1U;
+    }
+    else if (c != '\r' && longueur_en_cours < (GPS_TAILLE_TRAME - 1U))
+    {
+        trame_en_cours[longueur_en_cours++] = (char)c;
+    }
+}
+
+// FONCTIONS PUBLIQUES
+
 void GroveGPS_Init(void)
 {
     /*
-        * Port Grove A0 : Signal1=PA0=GPS_TX, Signal2=PA1=GPS_RX.
-        * Le module Air530Z émet sur Signal1 (PA0).
-        * Pin swap UART4 activé : PA0=UART4_RX, PA1=UART4_TX.
-        * L'init GPIO est centralisée dans HAL_UART_MspInit (setup.c).
+     * Port Grove A0 : Signal1=PA0=GPS_TX, Signal2=PA1=GPS_RX.
+     * Le module Air530Z émet sur Signal1 (PA0).
+     * Pin swap UART4 activé : PA0=UART4_RX, PA1=UART4_TX.
+     * L'init GPIO est centralisée dans HAL_UART_MspInit (setup.c).
      */
-    GPS_UART_HANDLE.Instance = UART4;
-    GPS_UART_HANDLE.Init.BaudRate = 9600;
-    GPS_UART_HANDLE.Init.WordLength = UART_WORDLENGTH_8B;
-    GPS_UART_HANDLE.Init.StopBits = UART_STOPBITS_1;
-    GPS_UART_HANDLE.Init.Parity = UART_PARITY_NONE;
-    GPS_UART_HANDLE.Init.Mode = UART_MODE_TX_RX;
-    GPS_UART_HANDLE.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-    GPS_UART_HANDLE.Init.OverSampling = UART_OVERSAMPLING_16;
-    GPS_UART_HANDLE.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-    GPS_UART_HANDLE.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_SWAP_INIT;
-    GPS_UART_HANDLE.AdvancedInit.Swap = UART_ADVFEATURE_SWAP_ENABLE;
+    gps_uart.Instance = UART4;
+    gps_uart.Init.BaudRate = 9600;
+    gps_uart.Init.WordLength = UART_WORDLENGTH_8B;
+    gps_uart.Init.StopBits = UART_STOPBITS_1;
+    gps_uart.Init.Parity = UART_PARITY_NONE;
+    gps_uart.Init.Mode = UART_MODE_TX_RX;
+    gps_uart.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    gps_uart.Init.OverSampling = UART_OVERSAMPLING_16;
+    gps_uart.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+    gps_uart.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_SWAP_INIT;
+    gps_uart.AdvancedInit.Swap = UART_ADVFEATURE_SWAP_ENABLE;
 
-    HAL_UART_Init(&GPS_UART_HANDLE);
+    HAL_UART_Init(&gps_uart);
+
+    // Interruption de réception UART4
+    HAL_NVIC_SetPriority(UART4_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(UART4_IRQn);
+
+    HAL_UART_Receive_IT(&gps_uart, &octet_recu, 1);
 }
 
-bool GroveGPS_ReadLine(char *buffer, unsigned int max_len, unsigned int timeout_ms)
-{
-    if (buffer == 0 || max_len == 0) return false;
-
-    unsigned int count = 0;
-    uint8_t c = 0;
-    uint32_t start = HAL_GetTick();
-
-    while ((HAL_GetTick() - start) < timeout_ms && count < (max_len - 1))
-    {
-        if (HAL_UART_Receive(&GPS_UART_HANDLE, &c, 1, 10) == HAL_OK)
-        {
-            if (c == '\n')
-            {
-                buffer[count] = '\0';
-                return true;
-            }
-
-            if (c != '\r')
-            {
-                buffer[count++] = (char)c;
-            }
-        }
-    }
-
-    buffer[count] = '\0';
-    return count > 0;
-}
-
-bool GroveGPS_ReadGGA(GPS_Data *gps, unsigned int timeout_ms)
+bool GroveGPS_ReadGGA(GPS_Data *gps, unsigned int age_max_ms)
 {
     if (gps == 0) return false;
 
-    char line[96];
-    uint32_t start = HAL_GetTick();
+    char copie[GPS_TAILLE_TRAME];
+    uint32_t instant;
 
-    while ((HAL_GetTick() - start) < timeout_ms)
+    // Copie protégée : l'interruption ne doit pas modifier la trame pendant la lecture
+    __disable_irq();
+    bool disponible = gga_disponible;
+    instant = gga_instant;
+    memcpy(copie, derniere_gga, sizeof(copie));
+    __enable_irq();
+
+    if (!disponible || (HAL_GetTick() - instant) > age_max_ms)
+        return false; // aucune trame récente : GPS débranché ou muet
+
+    return analyser_gga(copie, gps);
+}
+
+// INTERRUPTIONS
+
+void UART4_IRQHandler(void)
+{
+    HAL_UART_IRQHandler(&gps_uart);
+}
+
+// Appelé par la HAL à chaque octet reçu
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == UART4)
     {
-        if (!GroveGPS_ReadLine(line, sizeof(line), 500))
-            continue;
-
-        if (strncmp(line, "$GPGGA", 6) != 0 && strncmp(line, "$GNGGA", 6) != 0)
-            continue;
-
-        strncpy(gps->raw_sentence, line, sizeof(gps->raw_sentence) - 1);
-        gps->raw_sentence[sizeof(gps->raw_sentence) - 1] = '\0';
-
-        /*
-         * Format GGA :
-         * $GPGGA,time,lat,N,lon,E,fix,sats,hdop,alt,M,...
-         */
-        char copy[96];
-        strncpy(copy, line, sizeof(copy));
-        copy[sizeof(copy) - 1] = '\0';
-
-        char *fields[16] = {0};
-        int i = 0;
-        char *p = copy;
-
-        fields[i++] = p;
-        while (*p != '\0' && i < 16)
-        {
-            if (*p == ',')
-            {
-                *p = '\0';
-                fields[i++] = p + 1;
-            }
-            p++;
-        }
-
-        if (i < 8) return false;
-
-        gps->latitude = nmea_to_decimal(fields[2], fields[3] ? fields[3][0] : 'N');
-        gps->longitude = nmea_to_decimal(fields[4], fields[5] ? fields[5][0] : 'E');
-        gps->fix_quality = fields[6] ? (uint8_t)atoi(fields[6]) : 0;
-        gps->satellites = fields[7] ? (uint8_t)atoi(fields[7]) : 0;
-        gps->valid = gps->fix_quality > 0;
-
-        return true;
+        traiter_octet(octet_recu);
+        HAL_UART_Receive_IT(&gps_uart, &octet_recu, 1); // réarmement pour l'octet suivant
     }
+}
 
-    return false;
+// Erreur de réception (débordement, bruit au branchement...) : on relance la réception
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == UART4)
+    {
+        longueur_en_cours = 0U;
+        HAL_UART_Receive_IT(&gps_uart, &octet_recu, 1);
+    }
 }

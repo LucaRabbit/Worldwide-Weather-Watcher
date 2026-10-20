@@ -4,8 +4,15 @@
 #include <stdbool.h>
 #include "cesi_types.h"
 
+/*
+ * Réception par interruption : les trames NMEA sont reçues en arrière-plan,
+ * aucune fonction de ce pilote ne bloque le programme.
+ */
+
 void GroveGPS_Init(void);
-bool GroveGPS_ReadLine(char *buffer, unsigned int max_len, unsigned int timeout_ms);
-bool GroveGPS_ReadGGA(GPS_Data *gps, unsigned int timeout_ms);
+
+// Analyse la dernière trame GGA reçue, si elle date de moins de age_max_ms.
+// Retourne false si aucune trame récente (GPS débranché ou muet). Ne bloque jamais.
+bool GroveGPS_ReadGGA(GPS_Data *gps, unsigned int age_max_ms);
 
 #endif
