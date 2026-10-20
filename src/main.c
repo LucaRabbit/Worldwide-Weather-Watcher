@@ -47,8 +47,7 @@
 
 #define GPS_ATTENTE_MS      2000U        // attente max d'une trame GGA (le GPS en émet une par seconde)
 #define LUMIN_ERREUR        0xFFFFU      // valeur renvoyée par GroveLight_ReadRaw() en cas d'échec
-
-#define PERIODE_TEST_MS     2000U        // période d'affichage des mesures de test (ms)
+#define PERIODE_MAINTENANCE_MS  2000U    // rafraîchissement de l'affichage en maintenance (ms)
 
 // CODES D'ERREUR (rangés par priorité croissante : 1 bit par code dans erreurs_actives)
 
@@ -164,11 +163,71 @@ static void gestion_mode(void); // gestion des modes (délai de configuration, a
 // TODO
 static void    initialiser_systeme(void);           // capteurs, RTC, GPS, carte SD, CONFIG.TXT, revision_suivante
 static uint8_t acquerir_mesures(uint8_t lire_gps);  // capteurs + RTC (+ GPS si lire_gps) , retourne 1 si horodatage valide
+static void    afficher_mesures(void);              // affichage série des mesures (mode maintenance ou test capteurs)
 static void    enregistrer_sd(void);                // ligne de mesure, changement de date, archivage, écriture
 static void    traiter_commande(void);              // lecture et exécution d'une commande console
 static void    signaler_erreur(code_erreur_t code); // active le bit de l'erreur dans erreurs_actives
 static void    effacer_erreur(code_erreur_t code);  // efface le bit de l'erreur dans erreurs_actives
 static void    mettre_a_jour_led(void);             // erreur prioritaire en clignotement, sinon couleur du mode
+
+static void mode_standard_ou_eco(uint8_t facteur);  // acquisition + SD, facteur = 1 (standard) ou FACTEUR_ECO
+static void mode_maintenance(void);                 // acquisition + affichage série, sans SD
+static void mode_configuration(void);               // lecture et exécution d'une commande console, délai d'inactivité
+
+// MODE STANDARD / ÉCONOMIQUE
+
+static void mode_standard_ou_eco(uint8_t facteur)
+{
+    static uint32_t derniere_mesure = 0U;
+    static uint8_t  compteur_gps = 0U;
+    static bool     premiere_mesure = true;
+
+    uint32_t intervalle_ms = (uint32_t)params.log_interval * 60000U * facteur;
+
+    // Première mesure immédiate, puis une mesure par intervalle
+    if (!premiere_mesure && (HAL_GetTick() - derniere_mesure) < intervalle_ms)
+    {
+        return;
+    }
+    premiere_mesure = false;
+    derniere_mesure = HAL_GetTick();
+
+    // En éco, GPS lu 1 cycle sur FACTEUR_ECO ; en standard (facteur = 1), à chaque cycle
+    uint8_t lire_gps = ((compteur_gps % facteur) == 0U) ? 1U : 0U;
+    compteur_gps++;
+
+    acquerir_mesures(lire_gps);
+    // TODO: enregistrer_sd();
+}
+
+// MODE MAINTENANCE
+
+static void mode_maintenance(void)
+{
+    static uint32_t derniere_mesure = 0U;
+
+    if ((HAL_GetTick() - derniere_mesure) < PERIODE_MAINTENANCE_MS)
+    {
+        return;
+    }
+    derniere_mesure = HAL_GetTick();
+
+    acquerir_mesures(1U);  // GPS toujours lu en maintenance
+    afficher_mesures();    // affichage série, pas d'écriture SD (carte retirable)
+}
+
+// MODE CONFIGURATION
+
+static void mode_configuration(void)
+{
+    // traiter_commande(); // TODO : lecture et exécution d'une commande console
+
+    if ((HAL_GetTick() - config_derniere_activite) >= CONFIG_TIMEOUT_MS)
+    {
+        printf("Fin du delai de configuration\r\n");
+        changer_mode(MODE_STANDARD);
+    }
+}
 
 // GESTION DES ERREURS
  
@@ -507,33 +566,14 @@ static void initialiser_mode_demarrage(void)
 
 static void gestion_mode(void)
 {
-    if (mode_actuel == MODE_CONFIGURATION)
+    switch (mode_actuel)
     {
-        if ((HAL_GetTick() - config_derniere_activite) >= CONFIG_TIMEOUT_MS)
-        {
-            printf("Fin du delai de configuration\r\n");
-            changer_mode(MODE_STANDARD);
-        }
+        case MODE_STANDARD:      mode_standard_ou_eco(1U);          break;
+        case MODE_ECONOMIQUE:    mode_standard_ou_eco(FACTEUR_ECO); break;
+        case MODE_MAINTENANCE:   mode_maintenance();                break;
+        case MODE_CONFIGURATION: mode_configuration();              break;
+        default:                                                    break;
     }
-
-    // TODO : integration acquisitions des capteurs, enregistrement sur carte SD et autres traitements selon mode actif
-
-}
-
-// TEST DES CAPTEURS (affichage port série)
-
-static void test_capteurs(void)
-{
-    static uint32_t dernier_affichage = 0U;
-
-    if ((HAL_GetTick() - dernier_affichage) < PERIODE_TEST_MS)
-    {
-        return;
-    }
-    dernier_affichage = HAL_GetTick();
-
-    acquerir_mesures(1U);
-    afficher_mesures();
 }
 
 // PROGRAMME PRINCIPAL
@@ -566,6 +606,5 @@ int main(void)
 
         gestion_mode();
 
-        test_capteurs();
     }
 }
