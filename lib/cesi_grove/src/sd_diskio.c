@@ -35,9 +35,12 @@ extern SPI_HandleTypeDef SD_SPI_HANDLE;
 #define SD_TIMEOUT_INIT_MS   1000U
 #define SD_TIMEOUT_LECT_MS    200U
 #define SD_TIMEOUT_ECR_MS     500U
+#define SD_TIMEOUT_PRET_INIT_MS 20U   // carte absente ou bloquée : abandon rapide pendant l'initialisation
+#define SD_ESSAIS_CMD0          5U
 
 static volatile DSTATUS etat = STA_NOINIT;
 static uint8_t type_carte = 0U;
+static uint32_t delai_pret_ms = SD_TIMEOUT_ECR_MS; // attente max de la carte avant chaque commande
 
 // SPI BAS NIVEAU
 
@@ -94,7 +97,7 @@ static bool selectionner(void)
     HAL_GPIO_WritePin(SD_CS_PORT, SD_CS_PIN, GPIO_PIN_RESET);
     (void)spi_echanger(0xFFU);
 
-    if (attendre_prete(SD_TIMEOUT_ECR_MS))
+    if (attendre_prete(delai_pret_ms))
         return true;
 
     deselectionner();
@@ -190,6 +193,7 @@ DSTATUS disk_initialize(BYTE pdrv)
     uint8_t type = 0U;
 
     spi_vitesse(SPI_BAUDRATEPRESCALER_256); // 4 MHz / 256 = 15,6 kHz
+    delai_pret_ms = SD_TIMEOUT_PRET_INIT_MS;  // une carte qui répond est prête immédiatement
     HAL_Delay(10);
 
     // Au moins 74 cycles d'horloge, CS à l'état haut, pour réveiller la carte
@@ -198,7 +202,7 @@ DSTATUS disk_initialize(BYTE pdrv)
 
     // Passage en mode SPI (état idle) : certaines cartes demandent plusieurs essais
     uint8_t reponse_cmd0 = 0xFFU;
-    for (uint8_t essai = 0U; essai < 10U && reponse_cmd0 != 1U; essai++)
+    for (uint8_t essai = 0U; essai < SD_ESSAIS_CMD0 && reponse_cmd0 != 1U; essai++)
     {
         reponse_cmd0 = envoyer_commande(CMD0, 0U);
     }
@@ -239,6 +243,7 @@ DSTATUS disk_initialize(BYTE pdrv)
 
     type_carte = type;
     deselectionner();
+    delai_pret_ms = SD_TIMEOUT_ECR_MS; // en fonctionnement : une écriture peut occuper la carte jusqu'à 500 ms
 
     if (type != 0U)
     {

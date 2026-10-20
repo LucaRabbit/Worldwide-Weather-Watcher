@@ -1,11 +1,16 @@
 #include "sd_logger.h"
 #include "ff.h"
+#include "stm32l4xx_hal.h"
 #include <string.h>
+
+#define SD_DELAI_REMONTAGE_MS 2000U // carte absente : une tentative de remontage au plus toutes les 2 s
 
 void disk_reinitialiser(void); // sd_diskio.c
 
 static FATFS systeme_fichiers;
 static bool  montee = false;
+static bool     tentative_faite = false;
+static uint32_t derniere_tentative = 0U;
 
 // FONCTIONS INTERNES
 
@@ -33,10 +38,16 @@ static SDResultat traiter_erreur(FRESULT res)
     return (res == FR_DENIED) ? SD_ERR_PLEINE : SD_ERR_ACCES;
 }
 
-// Monte la carte si nécessaire (première utilisation ou carte réinsérée)
+// Monte la carte si nécessaire (première utilisation ou carte réinsérée).
+// Si la carte est absente, on ne retente pas à chaque appel : chaque tentative bloque le programme.
 static bool assurer_montage(void)
 {
-    return montee || SDLogger_Init();
+    if (montee) return true;
+
+    if (tentative_faite && (HAL_GetTick() - derniere_tentative) < SD_DELAI_REMONTAGE_MS)
+        return false;
+
+    return SDLogger_Init();
 }
 
 // FONCTIONS PUBLIQUES
@@ -45,6 +56,9 @@ bool SDLogger_Init(void)
 {
     demonter();
     disk_reinitialiser();
+
+    tentative_faite = true;
+    derniere_tentative = HAL_GetTick();
 
     montee = (f_mount(&systeme_fichiers, "", 1) == FR_OK); // 1 : montage immédiat (détecte l'absence de carte)
     return montee;
