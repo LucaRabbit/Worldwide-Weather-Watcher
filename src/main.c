@@ -45,6 +45,9 @@
 #define PRESSURE_MIN_DEFAUT   850U   // seuil bas de cohérence (hPa)
 #define PRESSURE_MAX_DEFAUT   1080U  // seuil haut de cohérence (hPa)
 
+#define GPS_ATTENTE_MS      2000U        // attente max d'une trame GGA (le GPS en émet une par seconde)
+#define LUMIN_ERREUR        0xFFFFU      // valeur renvoyée par GroveLight_ReadRaw() en cas d'échec
+
 #define PERIODE_TEST_MS     2000U        // période d'affichage des mesures de test (ms)
 
 // CODES D'ERREUR (rangés par priorité croissante : 1 bit par code dans erreurs_actives)
@@ -69,10 +72,81 @@ typedef enum
     MODE_CONFIGURATION
 } mode_fonctionnement_t;
 
+// CAPTEURS (index des compteurs de timeouts, NB_CAPTEURS = 4)
+ 
+typedef enum
+{
+    CAPT_TEMPERATURE,
+    CAPT_HUMIDITE,
+    CAPT_PRESSION,
+    CAPT_LUMINOSITE
+} capteur_t;
+
+// PARAMÈTRES (valeurs par défaut au démarrage, modifiables plus tard en mode configuration)
+ 
+typedef struct
+{
+    uint16_t log_interval;   // min
+    uint16_t file_max_size;  // octets
+    uint16_t timeout;        // s
+    uint8_t  lumin;
+    uint16_t lumin_low;
+    uint16_t lumin_high;
+    uint8_t  temp_air;
+    int8_t   min_temp_air;
+    int8_t   max_temp_air;
+    uint8_t  hygr;
+    int8_t   hygr_mint;
+    int8_t   hygr_maxt;
+    uint8_t  pressure;
+    uint16_t pressure_min;
+    uint16_t pressure_max;
+} parametres_t;
+
+// MESURES (dernière acquisition ; un champ *_ok à false = valeur NA)
+ 
+typedef struct
+{
+    RTC_DateTime horodatage;
+    bool     temperature_ok;
+    bool     humidite_ok;
+    bool     pression_ok;
+    bool     luminosite_ok;
+    bool     gps_ok;
+    float    temperature_c;
+    float    humidite_pct;
+    float    pression_hpa;
+    uint16_t luminosite;     // 0-1023
+    double   latitude;
+    double   longitude;
+} mesures_t;
+
 // VARIABLES GLOBALES
 
 static mode_fonctionnement_t mode_actuel    = MODE_STANDARD;
 static mode_fonctionnement_t mode_precedent = MODE_STANDARD; // mode à restaurer en sortie de maintenance
+static parametres_t params =
+{
+    .log_interval  = LOG_INTERVAL_DEFAUT,
+    .file_max_size = FILE_MAX_SIZE_DEFAUT,
+    .timeout       = TIMEOUT_DEFAUT,
+    .lumin         = LUMIN_DEFAUT,
+    .lumin_low     = LUMIN_LOW_DEFAUT,
+    .lumin_high    = LUMIN_HIGH_DEFAUT,
+    .temp_air      = TEMP_AIR_DEFAUT,
+    .min_temp_air  = MIN_TEMP_AIR_DEFAUT,
+    .max_temp_air  = MAX_TEMP_AIR_DEFAUT,
+    .hygr          = HYGR_DEFAUT,
+    .hygr_mint     = HYGR_MINT_DEFAUT,
+    .hygr_maxt     = HYGR_MAXT_DEFAUT,
+    .pressure      = PRESSURE_DEFAUT,
+    .pressure_min  = PRESSURE_MIN_DEFAUT,
+    .pressure_max  = PRESSURE_MAX_DEFAUT
+};
+static mesures_t mesures;                            // dernière acquisition (lue par enregistrer_sd)
+static uint8_t   erreurs_actives = 0U;               // 1 bit par code_erreur_t
+static uint8_t   nb_timeouts[NB_CAPTEURS] = {0U};    // timeouts consécutifs par capteur
+static uint8_t   nb_timeouts_gps = 0U;               // timeouts consécutifs du GPS
 
 // Délai d'inactivité du mode configuration
 static uint32_t config_derniere_activite = 0U;
@@ -95,6 +169,229 @@ static void    traiter_commande(void);              // lecture et exécution d'u
 static void    signaler_erreur(code_erreur_t code); // active le bit de l'erreur dans erreurs_actives
 static void    effacer_erreur(code_erreur_t code);  // efface le bit de l'erreur dans erreurs_actives
 static void    mettre_a_jour_led(void);             // erreur prioritaire en clignotement, sinon couleur du mode
+
+// GESTION DES ERREURS
+ 
+static void signaler_erreur(code_erreur_t code)
+{
+    erreurs_actives |= (uint8_t)(1U << code);
+}
+ 
+static void effacer_erreur(code_erreur_t code)
+{
+    erreurs_actives &= (uint8_t)~(1U << code);
+}
+ 
+// Met à jour le compteur de timeouts consécutifs d'un capteur
+static void compter_reponse(capteur_t capteur, bool reponse)
+{
+    if (reponse)
+    {
+        nb_timeouts[capteur] = 0U;
+    }
+    else if (nb_timeouts[capteur] < UINT8_MAX)
+    {
+        nb_timeouts[capteur]++;
+    }
+}
+ 
+// ACQUISITION DES MESURES
+ 
+static uint8_t acquerir_mesures(uint8_t lire_gps)
+{
+    bool incoherent = false;
+ 
+    // Toutes les valeurs à NA par défaut
+    mesures.temperature_ok = false;
+    mesures.humidite_ok    = false;
+    mesures.pression_ok    = false;
+    mesures.luminosite_ok  = false;
+    mesures.gps_ok         = false;
+ 
+    // 1. Horodatage
+    uint8_t horodatage_valide = RTCInterne_GetDateTime(&mesures.horodatage) ? 1U : 0U;
+ 
+    if (horodatage_valide)
+        effacer_erreur(ERR_RTC);
+    else
+        signaler_erreur(ERR_RTC);
+ 
+    // 2. BME280 : une seule lecture fournit température, humidité et pression
+    if (params.temp_air || params.hygr || params.pressure)
+    {
+        Env_Data env;
+        bool reponse = GroveBME280_ReadEnvironment(&env);
+ 
+        if (!reponse)
+        {
+            (void)GroveBME280_Init(); // nouvelle tentative au prochain cycle (capteur rebranché)
+        }
+ 
+        // Température
+        if (params.temp_air)
+        {
+            compter_reponse(CAPT_TEMPERATURE, reponse);
+ 
+            if (reponse)
+            {
+                if (env.temperature_c < params.min_temp_air || env.temperature_c > params.max_temp_air)
+                {
+                    incoherent = true; // valeur rejetée (reste NA)
+                }
+                else
+                {
+                    mesures.temperature_c  = env.temperature_c;
+                    mesures.temperature_ok = true;
+                }
+            }
+        }
+        else
+        {
+            nb_timeouts[CAPT_TEMPERATURE] = 0U;
+        }
+ 
+        // Humidité : ignorée si la température sort de [HYGR_MINT ; HYGR_MAXT]
+        if (params.hygr)
+        {
+            compter_reponse(CAPT_HUMIDITE, reponse);
+ 
+            if (reponse && env.temperature_c >= params.hygr_mint && env.temperature_c <= params.hygr_maxt) // valeur rejetée si température hors plage
+            {
+                mesures.humidite_pct = env.humidity_percent;
+                mesures.humidite_ok  = true;
+            }
+        }
+        else
+        {
+            nb_timeouts[CAPT_HUMIDITE] = 0U;
+        }
+ 
+        // Pression
+        if (params.pressure)
+        {
+            compter_reponse(CAPT_PRESSION, reponse);
+ 
+            if (reponse)
+            {
+                if (env.pressure_hpa < params.pressure_min || env.pressure_hpa > params.pressure_max)
+                {
+                    incoherent = true;
+                }
+                else
+                {
+                    mesures.pression_hpa = env.pressure_hpa;
+                    mesures.pression_ok  = true;
+                }
+            }
+        }
+        else
+        {
+            nb_timeouts[CAPT_PRESSION] = 0U;
+        }
+    }
+    else
+    {
+        nb_timeouts[CAPT_TEMPERATURE] = 0U;
+        nb_timeouts[CAPT_HUMIDITE]    = 0U;
+        nb_timeouts[CAPT_PRESSION]    = 0U;
+    }
+ 
+    // 3. Luminosité (0-1023)
+    if (params.lumin)
+    {
+        uint16_t lumiere = GroveLight_ReadRaw(); // 0-1023 (ADC 10 bits)
+        bool reponse = (lumiere != LUMIN_ERREUR);
+ 
+        compter_reponse(CAPT_LUMINOSITE, reponse);
+ 
+        if (reponse)
+        {
+            mesures.luminosite    = lumiere;
+            mesures.luminosite_ok = true;
+        }
+    }
+    else
+    {
+        nb_timeouts[CAPT_LUMINOSITE] = 0U;
+    }
+ 
+    // 4. GPS (en mode économique : un cycle sur deux)
+    if (lire_gps)
+    {
+        GPS_Data gps = {0};
+ 
+        if (GroveGPS_ReadGGA(&gps, GPS_ATTENTE_MS))
+        {
+            nb_timeouts_gps = 0U;
+ 
+            if (gps.valid) // trame reçue mais sans fix : position NA, pas d'erreur
+            {
+                mesures.latitude  = gps.latitude;
+                mesures.longitude = gps.longitude;
+                mesures.gps_ok    = true;
+            }
+        }
+        else if (nb_timeouts_gps < UINT8_MAX)
+        {
+            nb_timeouts_gps++;
+        }
+ 
+        if (nb_timeouts_gps >= NB_TIMEOUTS_ERREUR)
+            signaler_erreur(ERR_GPS);
+        else
+            effacer_erreur(ERR_GPS);
+    }
+ 
+    // 5. Erreur capteur : au moins un capteur sans réponse NB_TIMEOUTS_ERREUR fois de suite
+    bool erreur_capteur = false;
+ 
+    for (uint8_t i = 0U; i < NB_CAPTEURS; i++)
+    {
+        if (nb_timeouts[i] >= NB_TIMEOUTS_ERREUR)
+        {
+            erreur_capteur = true;
+        }
+    }
+ 
+    if (erreur_capteur)
+        signaler_erreur(ERR_CAPTEUR);
+    else
+        effacer_erreur(ERR_CAPTEUR);
+ 
+    // 6. Donnée incohérente
+    if (incoherent)
+        signaler_erreur(ERR_INCOHERENT);
+    else
+        effacer_erreur(ERR_INCOHERENT);
+ 
+    return horodatage_valide;
+}
+ 
+// AFFICHAGE DES MESURES (mode maintenance ou test capteurs)
+ 
+static void afficher_mesures(void)
+{
+    printf("%02u/%02u/%04u %02u:%02u:%02u | ",
+           mesures.horodatage.day, mesures.horodatage.month, mesures.horodatage.year,
+           mesures.horodatage.hours, mesures.horodatage.minutes, mesures.horodatage.seconds);
+ 
+    if (mesures.temperature_ok) printf("T=%.1f C | ", mesures.temperature_c);
+    else                        printf("T=" VALEUR_NA " | ");
+ 
+    if (mesures.humidite_ok)    printf("H=%.1f %% | ", mesures.humidite_pct);
+    else                        printf("H=" VALEUR_NA " | ");
+ 
+    if (mesures.pression_ok)    printf("P=%.1f hPa | ", mesures.pression_hpa);
+    else                        printf("P=" VALEUR_NA " | ");
+ 
+    if (mesures.luminosite_ok)  printf("L=%u | ", mesures.luminosite);
+    else                        printf("L=" VALEUR_NA " | ");
+ 
+    if (mesures.gps_ok)         printf("GPS=%.6f,%.6f", mesures.latitude, mesures.longitude);
+    else                        printf("GPS=" VALEUR_NA);
+ 
+    printf(" | erreurs=0x%02X\r\n", erreurs_actives);
+}
 
 // ACTIONS DU BOUTON ROUGE (appui long)
 
@@ -235,49 +532,8 @@ static void test_capteurs(void)
     }
     dernier_affichage = HAL_GetTick();
 
-    // Test du capteur de lumière
-    uint16_t lumiere = GroveLight_ReadRaw();
-
-    if (lumiere == 0xFFFFU)
-        printf("[LUM] erreur de lecture ADC\r\n");
-    else
-        printf("[LUM] %u / 1023\r\n", lumiere);
-
-    // Test du capteur BME280 (température, humidité, pression)
-    Env_Data env;
-
-    if (GroveBME280_ReadEnvironment(&env))
-        printf("[BME280] T=%.2f C  H=%.1f %%  P=%.2f hPa\r\n",
-               env.temperature_c, env.humidity_percent, env.pressure_hpa);
-    else
-        printf("[BME280] erreur de lecture\r\n");
-
-    // Test du GPS Air530Z (trame GGA)
-    GPS_Data gps = {0};
-    
-    if (GroveGPS_ReadGGA(&gps, 1500U))
-    {
-        printf("[GPS] %s\r\n", gps.raw_sentence);
-
-        if (gps.valid)
-            printf("[GPS] lat=%.6f lon=%.6f sats=%u\r\n",
-                   gps.latitude, gps.longitude, gps.satellites);
-        else
-            printf("[GPS] pas de fix (sats=%u)\r\n", gps.satellites);
-    }
-    else
-    {
-        printf("[GPS] aucune trame GGA recue\r\n");
-    }
-
-    // Test de l'horloge RTC interne
-    RTC_DateTime dt;
-
-    if (RTCInterne_GetDateTime(&dt))
-        printf("[RTC] %02u/%02u/%04u %02u:%02u:%02u\r\n",
-               dt.day, dt.month, dt.year, dt.hours, dt.minutes, dt.seconds, dt.dayOfWeek);
-    else
-        printf("[RTC] erreur de lecture\r\n");
+    acquerir_mesures(1U);
+    afficher_mesures();
 }
 
 // PROGRAMME PRINCIPAL
