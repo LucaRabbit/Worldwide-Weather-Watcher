@@ -158,6 +158,13 @@ void UART4_IRQHandler(void)
     HAL_UART_IRQHandler(&gps_uart);
 }
 
+/*
+ * La HAL n'autorise qu'un seul HAL_UART_RxCpltCallback pour tout le programme.
+ * Les autres UART (console USART2) sont transmis à UART_AutreRxCallback(), que la console redéfinit.
+ */
+__attribute__((weak)) void UART_AutreRxCallback(UART_HandleTypeDef *huart)    { (void)huart; }
+__attribute__((weak)) void UART_AutreErrorCallback(UART_HandleTypeDef *huart) { (void)huart; }
+
 // Appelé par la HAL à chaque octet reçu
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
@@ -165,6 +172,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     {
         traiter_octet(octet_recu);
         HAL_UART_Receive_IT(&gps_uart, &octet_recu, 1); // réarmement pour l'octet suivant
+    }
+    else
+    {
+        UART_AutreRxCallback(huart);
     }
 }
 
@@ -175,5 +186,9 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     {
         longueur_en_cours = 0U;
         HAL_UART_Receive_IT(&gps_uart, &octet_recu, 1);
+    }
+    else
+    {
+        UART_AutreErrorCallback(huart);
     }
 }

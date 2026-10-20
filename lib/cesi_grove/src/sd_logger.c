@@ -163,6 +163,17 @@ bool SDLogger_LireLignes(const char *nom, void (*traiter)(const char *ligne))
     return !erreur_lecture;
 }
 
+SDResultat SDLogger_Supprimer(const char *nom)
+{
+    if (nom == 0) return SD_ERR_ACCES;
+    if (!assurer_montage()) return SD_ERR_ACCES;
+
+    FRESULT res = f_unlink(nom);
+    if (res == FR_NO_FILE) return SD_OK; // déjà absent : rien à faire
+
+    return traiter_erreur(res);
+}
+
 bool SDLogger_EspaceLibre(uint32_t *ko_libres)
 {
     if (ko_libres == 0 || !assurer_montage()) return false;

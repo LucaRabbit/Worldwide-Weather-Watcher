@@ -34,4 +34,6 @@ bool       SDLogger_LireLignes(const char *nom, void (*traiter)(const char *lign
 
 bool       SDLogger_EspaceLibre(uint32_t *ko_libres);               // espace libre en kio
 
+SDResultat SDLogger_Supprimer(const char *nom);                     // SD_OK aussi si le fichier n'existe pas
+
 #endif
