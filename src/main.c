@@ -26,6 +26,11 @@
 #define TAILLE_LIGNE        128U         // TODO : tampon d'une ligne de mesures (>= 64 octets, à ajuster)
 #define TAILLE_COMMANDE     64U          // TODO : tampon d'une commande console (à ajuster)
 
+#define GPS_ATTENTE_MS      2000U        // attente max d'une trame GGA (le GPS en émet une par seconde)
+#define LUMIN_ERREUR        0xFFFFU      // valeur renvoyée par GroveLight_ReadRaw() en cas d'échec
+#define LED_PERIODE_MS      1000U        // période du clignotement d'erreur (1 Hz)
+#define PERIODE_MAINTENANCE_MS  2000U    // rafraîchissement de l'affichage en maintenance (ms)
+
 // VALEURS PAR DÉFAUT DES PARAMÈTRES (modifiables en mode configuration)
 // U = unsigned int
 
@@ -45,10 +50,6 @@
 #define PRESSURE_MIN_DEFAUT   850U   // seuil bas de cohérence (hPa)
 #define PRESSURE_MAX_DEFAUT   1080U  // seuil haut de cohérence (hPa)
 
-#define GPS_ATTENTE_MS      2000U        // attente max d'une trame GGA (le GPS en émet une par seconde)
-#define LUMIN_ERREUR        0xFFFFU      // valeur renvoyée par GroveLight_ReadRaw() en cas d'échec
-#define PERIODE_MAINTENANCE_MS  2000U    // rafraîchissement de l'affichage en maintenance (ms)
-
 // CODES D'ERREUR (rangés par priorité croissante : 1 bit par code dans erreurs_actives)
 
 typedef enum
@@ -60,6 +61,24 @@ typedef enum
     ERR_SD_PLEINE,
     ERR_SD_ACCES
 } code_erreur_t;
+
+// MOTIFS LED DES ERREURS (rouge en alternance avec une seconde couleur)
+
+typedef struct
+{
+    uint8_t r, g, b;        // seconde couleur
+    bool    double_duree;   // true : seconde couleur 2x plus longue que le rouge
+} motif_erreur_t;
+
+static const motif_erreur_t motifs_erreur[] =
+{
+    [ERR_GPS]        = {255, 255,   0, false}, // jaune
+    [ERR_CAPTEUR]    = {  0, 255,   0, false}, // vert
+    [ERR_INCOHERENT] = {  0, 255,   0, true }, // vert, 2x plus long
+    [ERR_RTC]        = {  0,   0, 255, false}, // bleu
+    [ERR_SD_PLEINE]  = {255, 255, 255, false}, // blanc
+    [ERR_SD_ACCES]   = {255, 255, 255, true }  // blanc, 2x plus long
+};
 
 // MODES DE FONCTIONNEMENT
 
@@ -505,8 +524,57 @@ static void afficher_couleur_mode(void)
     }
 }
 
-// CHANGEMENT DE MODE
+// AFFICHAGE LED : erreur prioritaire en clignotement, sinon couleur du mode
 
+static void mettre_a_jour_led(void)
+{
+    static int8_t  erreur_affichee = -2;   // -2 : rien d'affiché, -1 : couleur du mode
+    static uint8_t phase_affichee  = 0xFFU;
+    static mode_fonctionnement_t mode_affiche = MODE_STANDARD;
+
+    // Recherche de l'erreur la plus prioritaire (bit le plus haut)
+    int8_t erreur = -1;
+
+    for (int8_t i = (int8_t)ERR_SD_ACCES; i >= 0; i--)
+    {
+        if (erreurs_actives & (1U << i))
+        {
+            erreur = i;
+            break;
+        }
+    }
+
+    // Aucune erreur : couleur du mode (renvoyée seulement si elle a changé)
+    if (erreur < 0)
+    {
+        if (erreur_affichee != -1 || mode_affiche != mode_actuel)
+        {
+            afficher_couleur_mode();
+            erreur_affichee = -1;
+            mode_affiche = mode_actuel;
+        }
+        return;
+    }
+
+    // Erreur : rouge pendant 1/2 période (ou 1/3 si la seconde couleur dure 2x plus), puis seconde couleur
+    const motif_erreur_t *motif = &motifs_erreur[erreur];
+    uint32_t duree_rouge_ms = motif->double_duree ? (LED_PERIODE_MS / 3U) : (LED_PERIODE_MS / 2U);
+    uint8_t  phase = ((HAL_GetTick() % LED_PERIODE_MS) < duree_rouge_ms) ? 0U : 1U;
+
+    // La LED n'est mise à jour qu'au changement d'erreur ou de phase
+    if (erreur != erreur_affichee || phase != phase_affichee)
+    {
+        if (phase == 0U)
+            GroveRGB_SetColor(255, 0, 0);
+        else
+            GroveRGB_SetColor(motif->r, motif->g, motif->b);
+
+        erreur_affichee = erreur;
+        phase_affichee  = phase;
+    }
+}
+
+// CHANGEMENT DE MODE
 static void changer_mode(mode_fonctionnement_t nouveau_mode)
 {
     if (nouveau_mode == mode_actuel)
@@ -538,8 +606,6 @@ static void changer_mode(mode_fonctionnement_t nouveau_mode)
         default:
             break;
     }
-
-    afficher_couleur_mode(); // mise à jour de la couleur de la LED
 }
 
 // INITIALISATION DU MODE AU DEMARRAGE
@@ -605,6 +671,6 @@ int main(void)
         }
 
         gestion_mode();
-
+        mettre_a_jour_led();
     }
 }
