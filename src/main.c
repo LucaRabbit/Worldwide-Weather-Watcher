@@ -34,7 +34,7 @@
 // VALEURS PAR DÉFAUT DES PARAMÈTRES (modifiables en mode configuration)
 // U = unsigned int
 
-#define LOG_INTERVAL_DEFAUT   10000U    // intervalle entre deux mesures (min)
+#define LOG_INTERVAL_DEFAUT   1U    // intervalle entre deux mesures (min)
 #define FILE_MAX_SIZE_DEFAUT  2048U  // taille max d'un fichier de log (octets)
 #define TIMEOUT_DEFAUT        30U    // abandon de l'acquisition d'un capteur (s)
 #define LUMIN_DEFAUT          1U     // capteur de luminosité activé
@@ -50,11 +50,7 @@
 #define PRESSURE_MIN_DEFAUT   850U   // seuil bas de cohérence (hPa)
 #define PRESSURE_MAX_DEFAUT   1080U  // seuil haut de cohérence (hPa)
 
-#define GPS_ATTENTE_MS      2000U        // attente max d'une trame GGA (le GPS en émet une par seconde)
-#define LUMIN_ERREUR        0xFFFFU      // valeur renvoyée par GroveLight_ReadRaw() en cas d'échec
-#define PERIODE_MAINTENANCE_MS  2000U    // rafraîchissement de l'affichage en maintenance (ms)
-
-#define TAILLE_MOYENNE      5U           // nombre de mesures dans la moyenne glissante
+#define TAILLE_MOYENNE      5U       // nombre de mesures dans la moyenne glissante
 
 // CODES D'ERREUR (rangés par priorité croissante : 1 bit par code dans erreurs_actives)
 
@@ -441,7 +437,7 @@ static uint8_t acquerir_mesures(uint8_t lire_gps)
  
         if (reponse)
         {
-            mesures.luminosite    = moyenne_ajouter(&moy_luminosite, (float)lumiere);
+            mesures.luminosite = (uint16_t)(moyenne_ajouter(&moy_luminosite, (float)lumiere) + 0.5f);
             mesures.luminosite_ok = true;
         }
     }
