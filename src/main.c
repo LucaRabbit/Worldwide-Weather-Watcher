@@ -241,7 +241,7 @@ static void test_capteurs(void)
     if (lumiere == 0xFFFFU)
         printf("[LUM] erreur de lecture ADC\r\n");
     else
-        printf("[LUM] %u / 4095\r\n", lumiere);
+        printf("[LUM] %u / 1023\r\n", lumiere);
 
     // Test du capteur BME280 (température, humidité, pression)
     Env_Data env;
