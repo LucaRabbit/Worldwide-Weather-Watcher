@@ -205,9 +205,31 @@ static void    signaler_erreur(code_erreur_t code); // active le bit de l'erreur
 static void    effacer_erreur(code_erreur_t code);  // efface le bit de l'erreur dans erreurs_actives
 static void    mettre_a_jour_led(void);             // erreur prioritaire en clignotement, sinon couleur du mode
 
+static void    lire_config_sd(parametres_t *p);  // lecture du fichier CONFIG.TXT (si présent)
+static void    revision_suivante(void);          // incrémentation du numéro de révision des fichiers de log
+
+static float   moyenne_ajouter(moyenne_t *m, float valeur);  // ajoute une valeur (remplace la plus ancienne si le tampon est plein)
+
 static void mode_standard_ou_eco(uint8_t facteur);  // acquisition + SD, facteur = 1 (standard) ou FACTEUR_ECO
 static void mode_maintenance(void);                 // acquisition + affichage série, sans SD
 static void mode_configuration(void);               // lecture et exécution d'une commande console, délai d'inactivité
+
+
+// Initialisation du système (capteurs, RTC, GPS, carte SD, CONFIG.TXT, revision_suivante)
+static void initialiser_systeme(void)
+{
+    Global_Init();       // initialisation des périphériques HAL, horloge système, GPIO, UART, ADC, I2C, etc.
+    GroveRGB_Init();     // initialisation de la LED RGB (GPIO + PWM)
+    GroveButton_Init();  // initialisation des boutons (GPIO + interruption)
+    GroveLight_Init();   // initialisation du capteur de luminosité (ADC)
+    GroveBME280_Init();  // initialisation du capteur BME280 (I2C)
+    GroveGPS_Init();     // initialisation du GPS (UART)
+    RTCInterne_Init();   // initialisation du RTC interne (LSE ou LSI)
+    SDLogger_Init();     // initialisation de la carte SD (SPI)
+    lire_config_sd(&params);  // TODO : lecture du fichier CONFIG.TXT (si présent)
+    revision_suivante();      // TODO : incrémentation du numéro de révision
+}
+
 
 // MODE STANDARD / ÉCONOMIQUE
 
@@ -299,6 +321,20 @@ static void reinitialiser_moyennes(void)
     moyenne_vider(&moy_humidite);
     moyenne_vider(&moy_pression);
     moyenne_vider(&moy_luminosite);
+}
+
+// CONFIGURATION SUR CARTE SD
+
+// Lecture de CONFIG.TXT : remplace les valeurs de params par celles du fichier (s'il existe)
+static void lire_config_sd(parametres_t *p)
+{
+    (void)p; // TODO : lecture du fichier FICHIER_CONFIG
+}
+
+// Incrémentation du numéro de révision des fichiers de log
+static void revision_suivante(void)
+{
+    // TODO
 }
 
 // GESTION DES ERREURS
@@ -706,13 +742,7 @@ static void gestion_mode(void)
 
 int main(void)
 {
-    Global_Init();
-    GroveRGB_Init();
-    GroveButton_Init();
-    GroveLight_Init();
-    GroveBME280_Init();
-    GroveGPS_Init();
-    RTCInterne_Init();
+    initialiser_systeme();
 
     initialiser_mode_demarrage();
 
