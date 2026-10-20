@@ -10,6 +10,7 @@
 #include "grove_bme280.h"
 #include "sd_logger.h"
 #include "board_pins.h"
+#include <string.h>
 
 // CONFIGURATION
 
@@ -34,8 +35,10 @@
 // VALEURS PAR DÉFAUT DES PARAMÈTRES (modifiables en mode configuration)
 // U = unsigned int
 
-#define LOG_INTERVAL_DEFAUT   1U    // intervalle entre deux mesures (min)
-#define FILE_MAX_SIZE_DEFAUT  2048U  // taille max d'un fichier de log (octets)
+#define LOG_INTERVAL_DEFAUT   10U      // intervalle entre deux mesures (en unités LOG_INTERVAL_UNITE_MS)
+#define LOG_INTERVAL_UNITE_MS 1000U    // TEST : 1 unité = 1 s  |  FINAL : 60000U (1 unité = 1 min)
+
+#define FILE_MAX_SIZE_DEFAUT  512U  // taille max d'un fichier de log (octets)
 #define TIMEOUT_DEFAUT        30U    // abandon de l'acquisition d'un capteur (s)
 #define LUMIN_DEFAUT          1U     // capteur de luminosité activé
 #define LUMIN_LOW_DEFAUT      255U   // seuil luminosité faible (0-1023)
@@ -51,6 +54,9 @@
 #define PRESSURE_MAX_DEFAUT   1080U  // seuil haut de cohérence (hPa)
 
 #define TAILLE_MOYENNE      5U       // nombre de mesures dans la moyenne glissante
+
+#define REVISION_MAX        9U           // noms 8.3 : "AAMMJJ_N" -> un seul chiffre de révision (1 à 9)
+#define ENTETE_LOG          "DATE;TEMP_AIR;HYGR;PRESSURE;LUMIN;LATITUDE;LONGITUDE"
 
 // CODES D'ERREUR (rangés par priorité croissante : 1 bit par code dans erreurs_actives)
 
@@ -206,7 +212,6 @@ static void    effacer_erreur(code_erreur_t code);  // efface le bit de l'erreur
 static void    mettre_a_jour_led(void);             // erreur prioritaire en clignotement, sinon couleur du mode
 
 static void    lire_config_sd(parametres_t *p);  // lecture du fichier CONFIG.TXT (si présent)
-static void    revision_suivante(void);          // incrémentation du numéro de révision des fichiers de log
 
 static float   moyenne_ajouter(moyenne_t *m, float valeur);  // ajoute une valeur (remplace la plus ancienne si le tampon est plein)
 
@@ -214,8 +219,7 @@ static void mode_standard_ou_eco(uint8_t facteur);  // acquisition + SD, facteur
 static void mode_maintenance(void);                 // acquisition + affichage série, sans SD
 static void mode_configuration(void);               // lecture et exécution d'une commande console, délai d'inactivité
 
-
-// Initialisation du système (capteurs, RTC, GPS, carte SD, CONFIG.TXT, revision_suivante)
+// Initialisation du système (capteurs, RTC, GPS, carte SD, CONFIG.TXT)
 static void initialiser_systeme(void)
 {
     Global_Init();       // initialisation des périphériques HAL, horloge système, GPIO, UART, ADC, I2C, etc.
@@ -227,7 +231,6 @@ static void initialiser_systeme(void)
     RTCInterne_Init();   // initialisation du RTC interne (LSE ou LSI)
     SDLogger_Init();     // initialisation de la carte SD (SPI)
     lire_config_sd(&params);  // TODO : lecture du fichier CONFIG.TXT (si présent)
-    revision_suivante();      // TODO : incrémentation du numéro de révision
 }
 
 
@@ -239,7 +242,7 @@ static void mode_standard_ou_eco(uint8_t facteur)
     static uint8_t  compteur_gps = 0U;
     static bool     premiere_mesure = true;
 
-    uint32_t intervalle_ms = (uint32_t)params.log_interval * 60000U * facteur;
+    uint32_t intervalle_ms = (uint32_t)params.log_interval * LOG_INTERVAL_UNITE_MS * facteur;
 
     // Première mesure immédiate, puis une mesure par intervalle
     if (!premiere_mesure && (HAL_GetTick() - derniere_mesure) < intervalle_ms)
@@ -253,8 +256,10 @@ static void mode_standard_ou_eco(uint8_t facteur)
     uint8_t lire_gps = ((compteur_gps % facteur) == 0U) ? 1U : 0U;
     compteur_gps++;
 
-    acquerir_mesures(lire_gps);
-    // TODO: enregistrer_sd();
+    if (acquerir_mesures(lire_gps)) // horodatage valide : nécessaire pour nommer le fichier
+    {
+        enregistrer_sd();
+    }
 }
 
 // MODE MAINTENANCE
@@ -329,12 +334,6 @@ static void reinitialiser_moyennes(void)
 static void lire_config_sd(parametres_t *p)
 {
     (void)p; // TODO : lecture du fichier FICHIER_CONFIG
-}
-
-// Incrémentation du numéro de révision des fichiers de log
-static void revision_suivante(void)
-{
-    // TODO
 }
 
 // GESTION DES ERREURS
@@ -566,6 +565,114 @@ static void afficher_mesures(void)
     printf(" | erreurs=0x%02X\r\n", erreurs_actives);
 }
 
+// ENREGISTREMENT SUR CARTE SD
+ 
+// Nom du fichier de log : AAMMJJ_N.LOG (N = 0 pour le fichier en cours, 1 à 9 pour les archives)
+static void construire_nom_fichier(char *nom, size_t taille, const RTC_DateTime *dt, uint8_t revision)
+{
+    snprintf(nom, taille, "%02u%02u%02u_%u.LOG",
+             (unsigned)(dt->year % 100U), dt->month, dt->day, revision);
+}
+ 
+// Ajoute ";valeur" (ou ";NA") à la fin de la ligne
+static void ajouter_champ(char *ligne, size_t taille, bool ok, double valeur, uint8_t decimales)
+{
+    size_t n = strlen(ligne);
+ 
+    if (ok)
+        snprintf(&ligne[n], taille - n, ";%.*f", decimales, valeur);
+    else
+        snprintf(&ligne[n], taille - n, ";" VALEUR_NA);
+}
+ 
+// Ligne de mesure : JJ/MM/AAAA HH:MM:SS;T;H;P;L;LAT;LON
+static void construire_ligne(char *ligne, size_t taille)
+{
+    snprintf(ligne, taille, "%02u/%02u/%04u %02u:%02u:%02u",
+             mesures.horodatage.day, mesures.horodatage.month, mesures.horodatage.year,
+             mesures.horodatage.hours, mesures.horodatage.minutes, mesures.horodatage.seconds);
+ 
+    ajouter_champ(ligne, taille, mesures.temperature_ok, mesures.temperature_c, 1U);
+    ajouter_champ(ligne, taille, mesures.humidite_ok,    mesures.humidite_pct,  1U);
+    ajouter_champ(ligne, taille, mesures.pression_ok,    mesures.pression_hpa,  1U);
+    ajouter_champ(ligne, taille, mesures.luminosite_ok,  mesures.luminosite,    0U);
+    ajouter_champ(ligne, taille, mesures.gps_ok,         mesures.latitude,      6U);
+    ajouter_champ(ligne, taille, mesures.gps_ok,         mesures.longitude,     6U);
+}
+ 
+// Première révision libre du jour (1 à REVISION_MAX), 0 si toutes sont prises
+static uint8_t revision_suivante(const RTC_DateTime *dt)
+{
+    char nom[16];
+ 
+    for (uint8_t revision = 1U; revision <= REVISION_MAX; revision++)
+    {
+        construire_nom_fichier(nom, sizeof(nom), dt, revision);
+ 
+        if (!SDLogger_Existe(nom))
+            return revision;
+    }
+ 
+    return 0U;
+}
+ 
+// Archivage : AAMMJJ_0.LOG renommé en AAMMJJ_N.LOG, l'écriture reprend dans un _0 neuf
+static SDResultat archiver(const RTC_DateTime *dt)
+{
+    uint8_t revision = revision_suivante(dt);
+ 
+    if (revision == 0U)
+    {
+        printf("[SD] %u archives deja creees aujourd'hui : le fichier _0 continue de grossir\r\n", REVISION_MAX);
+        return SD_OK; // pas de perte de données : on préfère dépasser FILE_MAX_SIZE
+    }
+ 
+    char actuel[16], archive[16];
+    construire_nom_fichier(actuel,  sizeof(actuel),  dt, 0U);
+    construire_nom_fichier(archive, sizeof(archive), dt, revision);
+ 
+    SDResultat res = SDLogger_Renommer(actuel, archive);
+ 
+    if (res == SD_OK)
+        printf("[SD] archivage : %s -> %s\r\n", actuel, archive);
+ 
+    return res;
+}
+ 
+static void enregistrer_sd(void)
+{
+    char nom[16];
+    char ligne[TAILLE_LIGNE];
+ 
+    construire_nom_fichier(nom, sizeof(nom), &mesures.horodatage, 0U); // nouveau jour = nouveau fichier
+    construire_ligne(ligne, sizeof(ligne));
+ 
+    SDResultat res = SD_OK;
+    int32_t taille = SDLogger_TailleFichier(nom); // -1 : fichier absent (ou carte inaccessible)
+ 
+    // Archivage si la ligne ferait dépasser FILE_MAX_SIZE
+    if (taille >= 0 && (uint32_t)taille + strlen(ligne) + 2U > params.file_max_size)
+    {
+        res = archiver(&mesures.horodatage);
+        taille = SDLogger_TailleFichier(nom);
+    }
+ 
+    // Nouveau fichier : ligne d'en-tête
+    if (res == SD_OK && taille < 0)
+    {
+        res = SDLogger_AjouterLigne(nom, ENTETE_LOG);
+    }
+ 
+    if (res == SD_OK)
+    {
+        res = SDLogger_AjouterLigne(nom, ligne);
+    }
+ 
+    // Mise à jour des erreurs SD (affichées par la LED)
+    if (res == SD_ERR_PLEINE) signaler_erreur(ERR_SD_PLEINE); else effacer_erreur(ERR_SD_PLEINE);
+    if (res == SD_ERR_ACCES)  signaler_erreur(ERR_SD_ACCES);  else effacer_erreur(ERR_SD_ACCES);
+}
+
 // ACTIONS DU BOUTON ROUGE (appui long)
 
 static void appui_long_rouge(void)
@@ -745,7 +852,6 @@ int main(void)
     initialiser_systeme();
 
     printf("[SD] %s\r\n", SDLogger_EstPrete() ? "carte montee" : "carte absente ou non FAT");
-    printf("[SD] ecriture : %d (0 = OK)\r\n", SDLogger_AjouterLigne("TEST.LOG", "Bonjour WWW"));
 
     uint32_t ko;
     if (SDLogger_EspaceLibre(&ko))
