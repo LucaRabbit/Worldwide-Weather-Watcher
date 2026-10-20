@@ -5,7 +5,7 @@
 #include "grove_rgb.h"
 #include "grove_button.h"
 #include "grove_light.h"
-#include "grove_rtc_ds1307.h"
+#include "rtc_interne.h"
 #include "grove_gps_air530z.h"
 #include "grove_bme280.h"
 #include "sd_logger.h"
@@ -269,6 +269,15 @@ static void test_capteurs(void)
     {
         printf("[GPS] aucune trame GGA recue\r\n");
     }
+
+    // Test de l'horloge RTC interne
+    RTC_DateTime dt;
+
+    if (RTCInterne_GetDateTime(&dt))
+        printf("[RTC] %02u/%02u/%04u %02u:%02u:%02u\r\n",
+               dt.day, dt.month, dt.year, dt.hours, dt.minutes, dt.seconds, dt.dayOfWeek);
+    else
+        printf("[RTC] erreur de lecture\r\n");
 }
 
 // PROGRAMME PRINCIPAL
@@ -281,6 +290,7 @@ int main(void)
     GroveLight_Init();
     GroveBME280_Init();
     GroveGPS_Init();
+    RTCInterne_Init();
 
     initialiser_mode_demarrage();
 
