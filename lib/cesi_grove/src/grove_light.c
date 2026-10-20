@@ -60,3 +60,44 @@ uint16_t GroveLight_ReadRaw(void)
 
     return value;
 }
+
+// DÉTECTION DU CAPTEUR (technique de précharge)
+
+#define LIGHT_ECART_MAX        50U   // écart max entre les 2 mesures si le capteur est branché (sur 1023)
+#define LIGHT_PRECHARGE_BOUCLE 200   // environ 250 µs à 4 MHz : temps de charger la ligne
+
+// Force la ligne à 0 V (pull-down) ou 3,3 V (pull-up), puis mesure
+static uint16_t lire_apres_precharge(uint32_t tirage)
+{
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin = LIGHT_GPIO_PIN;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+
+    // 1. Entrée numérique avec résistance de tirage : charge la ligne
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = tirage;
+    HAL_GPIO_Init(LIGHT_GPIO_PORT, &gpio);
+
+    for (volatile int i = 0; i < LIGHT_PRECHARGE_BOUCLE; i++);
+
+    // 2. Retour en analogique, puis mesure immédiate
+    gpio.Mode = GPIO_MODE_ANALOG_ADC_CONTROL;
+    gpio.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(LIGHT_GPIO_PORT, &gpio);
+
+    return GroveLight_ReadRaw();
+}
+
+// Branché : l'ampli du capteur impose sa tension, les 2 mesures sont proches.
+// Débranché : la ligne flottante garde la précharge, les 2 mesures sont très éloignées.
+bool GroveLight_EstConnecte(void)
+{
+    uint16_t bas  = lire_apres_precharge(GPIO_PULLDOWN);
+    uint16_t haut = lire_apres_precharge(GPIO_PULLUP);
+
+    if (bas == 0xFFFFU || haut == 0xFFFFU)
+        return false;
+
+    uint16_t ecart = (haut > bas) ? (uint16_t)(haut - bas) : (uint16_t)(bas - haut);
+    return ecart < LIGHT_ECART_MAX;
+}
