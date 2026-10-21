@@ -17,7 +17,7 @@
 // CONFIGURATION
 
 // LONG_PRESS_MS et DEBOUNCE_MS : définis dans grove_button.h
-#define CONFIG_TIMEOUT_MS   60000U       // délai d'inactivité du mode configuration (10 s pour tester, 1800000U = 30 min en final)
+#define CONFIG_TIMEOUT_MS   30000U       // délai d'inactivité du mode configuration (30 s pour tester, 1800000U = 30 min en final)
 
 #define VERSION_PROGRAMME   "1.0.0"      // affiché par la commande VERSION
 #define NUMERO_LOT          "LOT-001"    // affiché par la commande VERSION
@@ -632,10 +632,10 @@ static void afficher_mesures(void)
 
 // ENREGISTREMENT SUR CARTE SD
 
-// Nom du fichier de log : AAMMJJ_N.LOG (N = 0 pour le fichier en cours, 1 à 9 pour les archives)
+// Nom du fichier de log : AAMMJJ_N.CSV (N = 0 pour le fichier en cours, 1 à 9 pour les archives)
 static void construire_nom_fichier(char *nom, size_t taille, const RTC_DateTime *dt, uint8_t revision)
 {
-    snprintf(nom, taille, "%02u%02u%02u_%u.LOG",
+    snprintf(nom, taille, "%02u%02u%02u_%u.CSV",
              (unsigned)(dt->year % 100U), dt->month, dt->day, revision);
 }
 
@@ -681,7 +681,7 @@ static uint8_t revision_suivante(const RTC_DateTime *dt)
     return 0U;
 }
 
-// Archivage : AAMMJJ_0.LOG renommé en AAMMJJ_N.LOG, l'écriture reprend dans un _0 neuf
+// Archivage : AAMMJJ_0.CSV renommé en AAMMJJ_N.CSV, l'écriture reprend dans un _0 neuf
 static SDResultat archiver(const RTC_DateTime *dt)
 {
     uint8_t revision = revision_suivante(dt);
