@@ -14,10 +14,31 @@
 #include "console.h"
 #include "board_pins.h"
 
+// RÉGLAGES DÉMONSTRATION / VERSION FINALE
+
+#ifndef MODE_DEMO      // peut être imposé à la compilation : ./build.sh -r  (=> -DMODE_DEMO=0)
+    #define MODE_DEMO  1   // 1 : délais courts pour la soutenance  |  0 : valeurs du cahier des charges (rendu)
+#endif
+
+#if MODE_DEMO
+    #define CONFIG_TIMEOUT_MS      60000U    // 1 min sans commande -> retour en mode standard
+    #define LOG_INTERVAL_UNITE_MS  1000U     // LOG_INTERVAL exprimé en secondes
+    #define LOG_INTERVAL_DEFAUT    10U       // une mesure toutes les 10 s (20 s en économique)
+    #define FILE_MAX_SIZE_DEFAUT   300U      // en-tête + 4 lignes : un archivage toutes les 40 s environ
+    #define FILE_MAX_SIZE_MIN      256U      // valeur minimale acceptée par FILE_MAX_SIZE=
+    #define TEXTE_MODE             " (DEMO)"
+#else
+    #define CONFIG_TIMEOUT_MS      1800000U  // 30 min sans commande -> retour en mode standard
+    #define LOG_INTERVAL_UNITE_MS  60000U    // LOG_INTERVAL exprimé en minutes
+    #define LOG_INTERVAL_DEFAUT    10U       // une mesure toutes les 10 min (20 min en économique)
+    #define FILE_MAX_SIZE_DEFAUT   2048U     // 2 Ko par fichier de log
+    #define FILE_MAX_SIZE_MIN      512U
+    #define TEXTE_MODE             ""
+#endif
+
 // CONFIGURATION
 
 // LONG_PRESS_MS et DEBOUNCE_MS : définis dans grove_button.h
-#define CONFIG_TIMEOUT_MS   30000U       // délai d'inactivité du mode configuration (30 s pour tester, 1800000U = 30 min en final)
 
 #define VERSION_PROGRAMME   "1.0.0"      // affiché par la commande VERSION
 #define NUMERO_LOT          "LOT-001"    // affiché par la commande VERSION
@@ -42,9 +63,7 @@
 
 // VALEURS PAR DÉFAUT DES PARAMÈTRES (modifiables en mode configuration et par CONFIG.TXT)
 
-#define LOG_INTERVAL_DEFAUT   10U    // intervalle entre deux mesures (en unités LOG_INTERVAL_UNITE_MS)
-#define LOG_INTERVAL_UNITE_MS 1000U  // TEST : 1 unité = 1 s  |  FINAL : 60000U (1 unité = 1 min)
-#define FILE_MAX_SIZE_DEFAUT  512U   // taille max d'un fichier de log (octets) - TEST : 512  |  FINAL : 2048U
+// LOG_INTERVAL_DEFAUT et FILE_MAX_SIZE_DEFAUT : voir RÉGLAGES DÉMONSTRATION / VERSION FINALE
 #define TIMEOUT_DEFAUT        30U    // abandon de l'acquisition d'un capteur (s)
 #define LUMIN_DEFAUT          1U     // capteur de luminosité activé
 #define LUMIN_LOW_DEFAUT      255U   // seuil luminosité faible (0-1023)
@@ -123,7 +142,7 @@ typedef struct
 
 typedef struct
 {
-    int32_t log_interval;   // en unités LOG_INTERVAL_UNITE_MS (min en version finale)
+    int32_t log_interval;   // en unités LOG_INTERVAL_UNITE_MS (s en démo, min en version finale)
     int32_t file_max_size;  // octets
     int32_t timeout;        // s
     int32_t lumin;
@@ -197,7 +216,7 @@ static parametres_t params; // copié depuis params_defaut au démarrage, puis C
 static const param_config_t table_params[] =
 {
     {"LOG_INTERVAL",  &params.log_interval,    1,  1440},  // au-delà de 24 h : dépassement du calcul en ms
-    {"FILE_MAX_SIZE", &params.file_max_size, 512, 16384},
+    {"FILE_MAX_SIZE", &params.file_max_size, FILE_MAX_SIZE_MIN, 16384},
     {"TIMEOUT",       &params.timeout,         1,   300},
     {"LUMIN",         &params.lumin,           0,     1},
     {"LUMIN_LOW",     &params.lumin_low,       0,  1023},
@@ -288,6 +307,14 @@ static void initialiser_systeme(void)
 {
     Global_Init();       // HAL, horloge système, I2C, SPI, UART console
     Console_Init();      // réception des commandes console (USART2 par interruption)
+
+    printf("\r\nWWW - version %s, lot %s%s\r\n", VERSION_PROGRAMME, NUMERO_LOT, TEXTE_MODE);
+
+    #if MODE_DEMO
+        printf("[DEMO] mesure toutes les %u s(mode standard), fichiers de %u octets, config quittee apres %u s sans commande\r\n",
+            (unsigned)LOG_INTERVAL_DEFAUT, (unsigned)FILE_MAX_SIZE_DEFAUT, (unsigned)(CONFIG_TIMEOUT_MS / 1000U));
+    #endif
+
     GroveRGB_Init();     // LED RGB
     GroveButton_Init();  // boutons
     GroveLight_Init();   // capteur de luminosité (ADC)
@@ -1027,7 +1054,7 @@ static void traiter_commande(char *commande)
 
     if (strcmp(commande, "VERSION") == 0)
     {
-        printf("WWW - version %s, lot %s\r\n", VERSION_PROGRAMME, NUMERO_LOT);
+        printf("WWW - version %s, lot %s%s\r\n", VERSION_PROGRAMME, NUMERO_LOT, TEXTE_MODE);
         return;
     }
     if (strcmp(commande, "RESET") == 0)
