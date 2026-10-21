@@ -26,6 +26,7 @@
     #define LOG_INTERVAL_DEFAUT    10U       // une mesure toutes les 10 s (20 s en économique)
     #define FILE_MAX_SIZE_DEFAUT   300U      // en-tête + 4 lignes : un archivage toutes les 40 s environ
     #define FILE_MAX_SIZE_MIN      256U      // valeur minimale acceptée par FILE_MAX_SIZE=
+    #define TIMEOUT_DEFAUT         5U        // capteur abandonné après 5 s sans réponse (erreur après 2 x 5 s)
     #define TEXTE_MODE             " (DEMO)"
 #else
     #define CONFIG_TIMEOUT_MS      1800000U  // 30 min sans commande -> retour en mode standard
@@ -33,6 +34,7 @@
     #define LOG_INTERVAL_DEFAUT    10U       // une mesure toutes les 10 min (20 min en économique)
     #define FILE_MAX_SIZE_DEFAUT   2048U     // 2 Ko par fichier de log
     #define FILE_MAX_SIZE_MIN      512U
+    #define TIMEOUT_DEFAUT         30U       // capteur abandonné après 30 s sans réponse
     #define TEXTE_MODE             ""
 #endif
 
@@ -55,6 +57,7 @@
 #define LUMIN_ERREUR        0xFFFFU      // valeur renvoyée par GroveLight_ReadRaw() en cas d'échec
 #define LED_PERIODE_MS      1000U        // période du clignotement d'erreur (1 Hz)
 #define PERIODE_MAINTENANCE_MS  2000U    // rafraîchissement de l'affichage en maintenance (ms)
+#define PERIODE_ESSAI_MS    500U         // capteur sans réponse : nouvel essai toutes les 500 ms, jusqu'à TIMEOUT
 
 #define TAILLE_MOYENNE      5U           // nombre de mesures dans la moyenne glissante
 
@@ -64,7 +67,7 @@
 // VALEURS PAR DÉFAUT DES PARAMÈTRES (modifiables en mode configuration et par CONFIG.TXT)
 
 // LOG_INTERVAL_DEFAUT et FILE_MAX_SIZE_DEFAUT : voir RÉGLAGES DÉMONSTRATION / VERSION FINALE
-#define TIMEOUT_DEFAUT        30U    // abandon de l'acquisition d'un capteur (s)
+// TIMEOUT_DEFAUT : voir RÉGLAGES DÉMONSTRATION / VERSION FINALE
 #define LUMIN_DEFAUT          1U     // capteur de luminosité activé
 #define LUMIN_LOW_DEFAUT      255U   // seuil luminosité faible (0-1023)
 #define LUMIN_HIGH_DEFAUT     768U   // seuil luminosité forte (0-1023)
@@ -239,6 +242,22 @@ static uint8_t   erreurs_actives = 0U;               // 1 bit par code_erreur_t
 static uint8_t   nb_timeouts[NB_CAPTEURS] = {0U};    // timeouts consécutifs par capteur
 static uint8_t   nb_timeouts_gps = 0U;               // timeouts consécutifs du GPS
 
+// Acquisition en cours : chaque capteur est réinterrogé jusqu'à sa réponse ou jusqu'à TIMEOUT,
+// sans bloquer la boucle principale (boutons et LED restent actifs pendant l'attente)
+typedef struct
+{
+    bool     en_cours;
+    uint32_t debut;              // HAL_GetTick() au lancement de l'acquisition
+    uint32_t dernier_essai;      // HAL_GetTick() du dernier essai de lecture
+    uint8_t  horodatage_valide;  // 1 si la RTC a répondu (nécessaire pour nommer le fichier)
+    bool     incoherent;         // une valeur hors seuils a été rejetée
+    bool     bme280_termine;     // réponse reçue ou TIMEOUT atteint
+    bool     lumiere_termine;
+    bool     gps_termine;
+} acquisition_t;
+
+static acquisition_t acq = {0};
+
 static moyenne_t moy_temperature;
 static moyenne_t moy_humidite;
 static moyenne_t moy_pression;
@@ -267,7 +286,13 @@ static void    afficher_couleur_mode(void);
 static void    mettre_a_jour_led(void);             // erreur prioritaire en clignotement, sinon couleur du mode
 
 // Acquisition
-static uint8_t acquerir_mesures(uint8_t lire_gps);  // capteurs + RTC (+ GPS si lire_gps), retourne 1 si horodatage valide
+static void    acquisition_demarrer(uint8_t lire_gps);  // lance une acquisition (RTC lue tout de suite)
+static bool    acquisition_continuer(void);         // un essai par capteur en attente ; true quand tout est terminé
+static void    acquisition_annuler(void);           // changement de mode pendant une acquisition
+static void    resultat_bme280(const Env_Data *env);       // env = 0 : TIMEOUT atteint
+static void    resultat_lumiere(bool reponse, uint16_t valeur);
+static void    resultat_gps(bool reponse, const GPS_Data *gps);
+static void    terminer_acquisition(void);          // moyennes, erreurs capteur / GPS / incohérence
 static void    afficher_mesures(void);              // affichage série des mesures (mode maintenance)
 static void    compter_reponse(capteur_t capteur, bool reponse);
 static float   moyenne_ajouter(moyenne_t *m, float valeur);
@@ -311,8 +336,10 @@ static void initialiser_systeme(void)
     printf("\r\nWWW - version %s, lot %s%s\r\n", VERSION_PROGRAMME, NUMERO_LOT, TEXTE_MODE);
 
     #if MODE_DEMO
-        printf("[DEMO] mesure toutes les %u s(mode standard), fichiers de %u octets, config quittee apres %u s sans commande\r\n",
-            (unsigned)LOG_INTERVAL_DEFAUT, (unsigned)FILE_MAX_SIZE_DEFAUT, (unsigned)(CONFIG_TIMEOUT_MS / 1000U));
+        printf("[DEMO] mesure toutes les %u s (mode standard), fichiers de %u octets, capteur abandonne apres %u s, "
+               "config quittee apres %u s sans commande\r\n",
+            (unsigned)LOG_INTERVAL_DEFAUT, (unsigned)FILE_MAX_SIZE_DEFAUT, (unsigned)TIMEOUT_DEFAUT,
+            (unsigned)(CONFIG_TIMEOUT_MS / 1000U));
     #endif
 
     GroveRGB_Init();     // LED RGB
@@ -337,19 +364,25 @@ static void mode_standard_ou_eco(uint8_t facteur)
 
     uint32_t intervalle_ms = (uint32_t)params.log_interval * LOG_INTERVAL_UNITE_MS * facteur;
 
-    // Première mesure immédiate, puis une mesure par intervalle
-    if (!premiere_mesure && (HAL_GetTick() - derniere_mesure) < intervalle_ms)
+    // Lancement : première mesure immédiate, puis une mesure par intervalle
+    if (!acq.en_cours)
     {
-        return;
+        if (!premiere_mesure && (HAL_GetTick() - derniere_mesure) < intervalle_ms)
+        {
+            return;
+        }
+        premiere_mesure = false;
+        derniere_mesure = HAL_GetTick();
+
+        // En éco, GPS lu 1 cycle sur FACTEUR_ECO ; en standard (facteur = 1), à chaque cycle
+        uint8_t lire_gps = ((compteur_gps % facteur) == 0U) ? 1U : 0U;
+        compteur_gps++;
+
+        acquisition_demarrer(lire_gps);
     }
-    premiere_mesure = false;
-    derniere_mesure = HAL_GetTick();
 
-    // En éco, GPS lu 1 cycle sur FACTEUR_ECO ; en standard (facteur = 1), à chaque cycle
-    uint8_t lire_gps = ((compteur_gps % facteur) == 0U) ? 1U : 0U;
-    compteur_gps++;
-
-    if (acquerir_mesures(lire_gps)) // horodatage valide : nécessaire pour nommer le fichier
+    // Suite de l'acquisition (peut durer jusqu'à TIMEOUT si un capteur ne répond pas)
+    if (acquisition_continuer() && acq.horodatage_valide) // horodatage valide : nécessaire pour nommer le fichier
     {
         enregistrer_sd();
     }
@@ -361,14 +394,21 @@ static void mode_maintenance(void)
 {
     static uint32_t derniere_mesure = 0U;
 
-    if ((HAL_GetTick() - derniere_mesure) < PERIODE_MAINTENANCE_MS)
+    if (!acq.en_cours)
     {
-        return;
-    }
-    derniere_mesure = HAL_GetTick();
+        if ((HAL_GetTick() - derniere_mesure) < PERIODE_MAINTENANCE_MS)
+        {
+            return;
+        }
+        derniere_mesure = HAL_GetTick();
 
-    acquerir_mesures(1U);  // GPS toujours lu en maintenance
-    afficher_mesures();    // affichage série, pas d'écriture SD (carte retirable)
+        acquisition_demarrer(1U);  // GPS toujours lu en maintenance
+    }
+
+    if (acquisition_continuer())
+    {
+        afficher_mesures();        // affichage série, pas d'écriture SD (carte retirable)
+    }
 }
 
 // MODE CONFIGURATION
@@ -454,11 +494,16 @@ static void compter_reponse(capteur_t capteur, bool reponse)
 }
 
 // ACQUISITION DES MESURES
+//
+// Une acquisition se déroule sur plusieurs tours de la boucle principale :
+//   acquisition_demarrer()  : toutes les valeurs à NA, lecture de la RTC
+//   acquisition_continuer() : un essai par capteur encore en attente (toutes les PERIODE_ESSAI_MS) ;
+//                             un capteur qui n'a pas répondu après TIMEOUT secondes est abandonné (NA)
+//   terminer_acquisition()  : quand tous les capteurs ont répondu ou sont abandonnés
+// Deux abandons consécutifs (NB_TIMEOUTS_ERREUR) déclenchent l'erreur capteur ou GPS.
 
-static uint8_t acquerir_mesures(uint8_t lire_gps)
+static void acquisition_demarrer(uint8_t lire_gps)
 {
-    bool incoherent = false;
-
     // Toutes les valeurs à NA par défaut
     mesures.temperature_ok = false;
     mesures.humidite_ok    = false;
@@ -466,112 +511,199 @@ static uint8_t acquerir_mesures(uint8_t lire_gps)
     mesures.luminosite_ok  = false;
     mesures.gps_ok         = false;
 
-    // 1. Horodatage
-    uint8_t horodatage_valide = RTCInterne_GetDateTime(&mesures.horodatage) ? 1U : 0U;
+    acq.en_cours      = true;
+    acq.debut         = HAL_GetTick();
+    acq.dernier_essai = acq.debut - PERIODE_ESSAI_MS; // premier essai immédiat
+    acq.incoherent    = false;
 
-    if (horodatage_valide)
+    // Horodatage : la RTC interne répond immédiatement
+    acq.horodatage_valide = RTCInterne_GetDateTime(&mesures.horodatage) ? 1U : 0U;
+
+    if (acq.horodatage_valide)
         effacer_erreur(ERR_RTC);
     else
         signaler_erreur(ERR_RTC);
 
-    // 2. BME280 : une seule lecture fournit température, humidité et pression
-    if (params.temp_air || params.hygr || params.pressure)
+    // Un capteur désactivé est considéré comme terminé (pas lu, pas d'erreur)
+    acq.bme280_termine  = !(params.temp_air || params.hygr || params.pressure);
+    acq.lumiere_termine = !params.lumin;
+    acq.gps_termine     = !lire_gps;
+
+    if (!params.temp_air) nb_timeouts[CAPT_TEMPERATURE] = 0U;
+    if (!params.hygr)     nb_timeouts[CAPT_HUMIDITE]    = 0U;
+    if (!params.pressure) nb_timeouts[CAPT_PRESSION]    = 0U;
+    if (!params.lumin)    nb_timeouts[CAPT_LUMINOSITE]  = 0U;
+}
+
+static bool acquisition_continuer(void)
+{
+    if (!acq.en_cours) return false;
+
+    uint32_t maintenant = HAL_GetTick();
+
+    if ((maintenant - acq.dernier_essai) < PERIODE_ESSAI_MS)
+    {
+        return false; // pas encore l'heure du prochain essai
+    }
+    acq.dernier_essai = maintenant;
+
+    bool timeout_atteint = (maintenant - acq.debut) >= (uint32_t)params.timeout * 1000U;
+
+    // BME280 : une seule lecture fournit température, humidité et pression
+    if (!acq.bme280_termine)
     {
         Env_Data env;
-        bool reponse = GroveBME280_ReadEnvironment(&env);
 
-        if (!reponse)
+        if (GroveBME280_ReadEnvironment(&env))
         {
-            (void)GroveBME280_Init(); // nouvelle tentative au prochain cycle (capteur rebranché)
+            resultat_bme280(&env);
+            acq.bme280_termine = true;
         }
-
-        // Température
-        if (params.temp_air)
+        else if (timeout_atteint)
         {
-            compter_reponse(CAPT_TEMPERATURE, reponse);
-
-            if (reponse)
-            {
-                if (env.temperature_c < params.min_temp_air || env.temperature_c > params.max_temp_air)
-                {
-                    incoherent = true; // valeur rejetée (reste NA)
-                }
-                else
-                {
-                    mesures.temperature_c  = moyenne_ajouter(&moy_temperature, env.temperature_c);
-                    mesures.temperature_ok = true;
-                }
-            }
+            resultat_bme280(0);
+            acq.bme280_termine = true;
         }
         else
         {
-            nb_timeouts[CAPT_TEMPERATURE] = 0U;
-        }
-
-        // Humidité : ignorée si la température sort de [HYGR_MINT ; HYGR_MAXT]
-        if (params.hygr)
-        {
-            compter_reponse(CAPT_HUMIDITE, reponse);
-
-            if (reponse && env.temperature_c >= params.hygr_mint && env.temperature_c <= params.hygr_maxt)
-            {
-                mesures.humidite_pct = moyenne_ajouter(&moy_humidite, env.humidity_percent);
-                mesures.humidite_ok  = true;
-            }
-        }
-        else
-        {
-            nb_timeouts[CAPT_HUMIDITE] = 0U;
-        }
-
-        // Pression
-        if (params.pressure)
-        {
-            compter_reponse(CAPT_PRESSION, reponse);
-
-            if (reponse)
-            {
-                if (env.pressure_hpa < params.pressure_min || env.pressure_hpa > params.pressure_max)
-                {
-                    incoherent = true;
-                }
-                else
-                {
-                    mesures.pression_hpa = moyenne_ajouter(&moy_pression, env.pressure_hpa);
-                    mesures.pression_ok  = true;
-                }
-            }
-        }
-        else
-        {
-            nb_timeouts[CAPT_PRESSION] = 0U;
+            (void)GroveBME280_Init(); // capteur rebranché : réinitialisation avant le prochain essai
         }
     }
-    else
-    {
-        nb_timeouts[CAPT_TEMPERATURE] = 0U;
-        nb_timeouts[CAPT_HUMIDITE]    = 0U;
-        nb_timeouts[CAPT_PRESSION]    = 0U;
-    }
 
-    // 3. Luminosité (0-1023)
-    if (params.lumin)
+    // Luminosité (0-1023)
+    if (!acq.lumiere_termine)
     {
         uint16_t lumiere = GroveLight_ReadRaw(); // 0-1023 (ADC 10 bits)
         bool reponse = (lumiere != LUMIN_ERREUR) && GroveLight_EstConnecte();
 
-        compter_reponse(CAPT_LUMINOSITE, reponse);
+        if (reponse || timeout_atteint)
+        {
+            resultat_lumiere(reponse, lumiere);
+            acq.lumiere_termine = true;
+        }
+    }
+
+    // GPS (en mode économique : un cycle sur deux)
+    if (!acq.gps_termine)
+    {
+        GPS_Data gps = {0};
+        bool reponse = GroveGPS_ReadGGA(&gps, GPS_ATTENTE_MS);
+
+        if (reponse || timeout_atteint)
+        {
+            resultat_gps(reponse, &gps);
+            acq.gps_termine = true;
+        }
+    }
+
+    if (acq.bme280_termine && acq.lumiere_termine && acq.gps_termine)
+    {
+        terminer_acquisition();
+        return true;
+    }
+
+    return false;
+}
+
+static void acquisition_annuler(void)
+{
+    acq.en_cours = false;
+}
+
+// Résultat du BME280 (env = 0 : aucune réponse avant TIMEOUT)
+static void resultat_bme280(const Env_Data *env)
+{
+    bool reponse = (env != 0);
+
+    // Température
+    if (params.temp_air)
+    {
+        compter_reponse(CAPT_TEMPERATURE, reponse);
 
         if (reponse)
         {
-            mesures.luminosite    = (uint16_t)(moyenne_ajouter(&moy_luminosite, (float)lumiere) + 0.5f);
-            mesures.luminosite_ok = true;
+            if (env->temperature_c < params.min_temp_air || env->temperature_c > params.max_temp_air)
+            {
+                acq.incoherent = true; // valeur rejetée (reste NA)
+            }
+            else
+            {
+                mesures.temperature_c  = moyenne_ajouter(&moy_temperature, env->temperature_c);
+                mesures.temperature_ok = true;
+            }
         }
     }
-    else
+
+    // Humidité : ignorée si la température sort de [HYGR_MINT ; HYGR_MAXT]
+    if (params.hygr)
     {
-        nb_timeouts[CAPT_LUMINOSITE] = 0U;
+        compter_reponse(CAPT_HUMIDITE, reponse);
+
+        if (reponse && env->temperature_c >= params.hygr_mint && env->temperature_c <= params.hygr_maxt)
+        {
+            mesures.humidite_pct = moyenne_ajouter(&moy_humidite, env->humidity_percent);
+            mesures.humidite_ok  = true;
+        }
     }
+
+    // Pression
+    if (params.pressure)
+    {
+        compter_reponse(CAPT_PRESSION, reponse);
+
+        if (reponse)
+        {
+            if (env->pressure_hpa < params.pressure_min || env->pressure_hpa > params.pressure_max)
+            {
+                acq.incoherent = true;
+            }
+            else
+            {
+                mesures.pression_hpa = moyenne_ajouter(&moy_pression, env->pressure_hpa);
+                mesures.pression_ok  = true;
+            }
+        }
+    }
+}
+
+static void resultat_lumiere(bool reponse, uint16_t valeur)
+{
+    compter_reponse(CAPT_LUMINOSITE, reponse);
+
+    if (reponse)
+    {
+        mesures.luminosite    = (uint16_t)(moyenne_ajouter(&moy_luminosite, (float)valeur) + 0.5f);
+        mesures.luminosite_ok = true;
+    }
+}
+
+static void resultat_gps(bool reponse, const GPS_Data *gps)
+{
+    if (reponse)
+    {
+        nb_timeouts_gps = 0U;
+
+        if (gps->valid) // trame reçue mais sans fix : position NA, pas d'erreur
+        {
+            mesures.latitude  = gps->latitude;
+            mesures.longitude = gps->longitude;
+            mesures.gps_ok    = true;
+        }
+    }
+    else if (nb_timeouts_gps < UINT8_MAX)
+    {
+        nb_timeouts_gps++;
+    }
+
+    if (nb_timeouts_gps >= NB_TIMEOUTS_ERREUR)
+        signaler_erreur(ERR_GPS);
+    else
+        effacer_erreur(ERR_GPS);
+}
+
+static void terminer_acquisition(void)
+{
+    acq.en_cours = false;
 
     // Mesure NA : historique interrompu, la moyenne repart de zéro
     if (!mesures.temperature_ok) moyenne_vider(&moy_temperature);
@@ -579,34 +711,7 @@ static uint8_t acquerir_mesures(uint8_t lire_gps)
     if (!mesures.pression_ok)    moyenne_vider(&moy_pression);
     if (!mesures.luminosite_ok)  moyenne_vider(&moy_luminosite);
 
-    // 4. GPS (en mode économique : un cycle sur deux)
-    if (lire_gps)
-    {
-        GPS_Data gps = {0};
-
-        if (GroveGPS_ReadGGA(&gps, GPS_ATTENTE_MS))
-        {
-            nb_timeouts_gps = 0U;
-
-            if (gps.valid) // trame reçue mais sans fix : position NA, pas d'erreur
-            {
-                mesures.latitude  = gps.latitude;
-                mesures.longitude = gps.longitude;
-                mesures.gps_ok    = true;
-            }
-        }
-        else if (nb_timeouts_gps < UINT8_MAX)
-        {
-            nb_timeouts_gps++;
-        }
-
-        if (nb_timeouts_gps >= NB_TIMEOUTS_ERREUR)
-            signaler_erreur(ERR_GPS);
-        else
-            effacer_erreur(ERR_GPS);
-    }
-
-    // 5. Erreur capteur : au moins un capteur sans réponse NB_TIMEOUTS_ERREUR fois de suite
+    // Erreur capteur : au moins un capteur abandonné NB_TIMEOUTS_ERREUR fois de suite
     bool erreur_capteur = false;
 
     for (uint8_t i = 0U; i < NB_CAPTEURS; i++)
@@ -622,13 +727,11 @@ static uint8_t acquerir_mesures(uint8_t lire_gps)
     else
         effacer_erreur(ERR_CAPTEUR);
 
-    // 6. Donnée incohérente
-    if (incoherent)
+    // Donnée incohérente
+    if (acq.incoherent)
         signaler_erreur(ERR_INCOHERENT);
     else
         effacer_erreur(ERR_INCOHERENT);
-
-    return horodatage_valide;
 }
 
 // AFFICHAGE DES MESURES (mode maintenance)
@@ -1204,6 +1307,7 @@ static void changer_mode(mode_fonctionnement_t nouveau_mode)
     }
 
     mode_actuel = nouveau_mode;
+    acquisition_annuler();    // une acquisition commencée dans l'ancien mode est abandonnée
     reinitialiser_moyennes(); // pas de mélange entre les mesures de deux modes
 
     switch (mode_actuel)
