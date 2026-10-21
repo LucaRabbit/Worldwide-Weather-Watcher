@@ -62,7 +62,7 @@
 #define TAILLE_MOYENNE      5U           // nombre de mesures dans la moyenne glissante
 
 #define REVISION_MAX        9U           // noms 8.3 : "AAMMJJ_N" -> un seul chiffre de révision (1 à 9)
-#define ENTETE_LOG          "DATE;TEMP_AIR;HYGR;PRESSURE;LUMIN;LATITUDE;LONGITUDE"
+// L'en-tête des fichiers CSV est construit à partir des noms des capteurs (construire_entete)
 
 // VALEURS PAR DÉFAUT DES PARAMÈTRES (modifiables en mode configuration et par CONFIG.TXT)
 
@@ -121,7 +121,8 @@ typedef enum
     MODE_CONFIGURATION
 } mode_fonctionnement_t;
 
-// CAPTEURS (index des compteurs de timeouts, NB_CAPTEURS = 4)
+// CAPTEURS : identifiant = indice dans le tableau capteurs[] (NB_CAPTEURS = 4)
+// L'ordre est celui des colonnes du fichier CSV et de l'affichage.
 
 typedef enum
 {
@@ -129,7 +130,14 @@ typedef enum
     CAPT_HUMIDITE,
     CAPT_PRESSION,
     CAPT_LUMINOSITE
-} capteur_t;
+} capteur_id_t;
+
+// Périphérique qui fournit la valeur d'un capteur
+typedef enum
+{
+    SOURCE_BME280,   // une seule lecture I2C donne température, humidité et pression
+    SOURCE_LUMIERE   // ADC
+} source_t;
 
 // MOYENNE GLISSANTE (tampon circulaire des TAILLE_MOYENNE dernières mesures valides)
 
@@ -139,6 +147,31 @@ typedef struct
     uint8_t index;      // case où sera écrite la prochaine valeur
     uint8_t nombre;     // nombre de valeurs présentes (< TAILLE_MOYENNE au démarrage)
 } moyenne_t;
+
+// UN CAPTEUR (prosit « Un peu de structure ») : sa description et toutes ses données regroupées,
+// pour traiter les capteurs par une boucle sur le tableau au lieu d'un bloc de code par capteur.
+
+typedef struct
+{
+    // Description (fixe)
+    const char    *nom;         // colonne du fichier CSV, identique au paramètre de configuration
+    const char    *libelle;     // affichage série
+    const char    *unite;       // affichage série
+    uint8_t        decimales;   // chiffres après la virgule (fichier CSV et affichage)
+    source_t       source;      // périphérique qui fournit la valeur
+    const int32_t *actif;       // paramètre d'activation (TEMP_AIR, HYGR, PRESSURE, LUMIN)
+    const int32_t *seuil_min;   // seuils de cohérence, 0 si aucun : hors seuils -> NA + ERR_INCOHERENT
+    const int32_t *seuil_max;
+    const int32_t *temp_min;    // plage de température requise, 0 si aucune : hors plage -> NA sans erreur
+    const int32_t *temp_max;
+
+    // État (variable)
+    float          valeur;      // dernière moyenne glissante, valable si ok
+    bool           ok;          // false : valeur NA
+    bool           termine;     // acquisition en cours : réponse reçue ou TIMEOUT atteint
+    uint8_t        nb_timeouts; // abandons consécutifs (NB_TIMEOUTS_ERREUR -> ERR_CAPTEUR)
+    moyenne_t      moyenne;     // fenêtre des dernières mesures valides
+} capteur_t;
 
 // PARAMÈTRES
 // Tous en int32_t : un seul type pour la table des commandes (pas de pointeur converti vers une autre taille)
@@ -176,15 +209,7 @@ typedef struct
 typedef struct
 {
     RTC_DateTime horodatage;
-    bool     temperature_ok;
-    bool     humidite_ok;
-    bool     pression_ok;
-    bool     luminosite_ok;
     bool     gps_ok;
-    float    temperature_c;
-    float    humidite_pct;
-    float    pression_hpa;
-    uint16_t luminosite;     // 0-1023
     double   latitude;
     double   longitude;
 } mesures_t;
@@ -239,7 +264,6 @@ static const param_config_t table_params[] =
 
 static mesures_t mesures;                            // dernière acquisition (lue par enregistrer_sd)
 static uint8_t   erreurs_actives = 0U;               // 1 bit par code_erreur_t
-static uint8_t   nb_timeouts[NB_CAPTEURS] = {0U};    // timeouts consécutifs par capteur
 static uint8_t   nb_timeouts_gps = 0U;               // timeouts consécutifs du GPS
 
 // Acquisition en cours : chaque capteur est réinterrogé jusqu'à sa réponse ou jusqu'à TIMEOUT,
@@ -251,17 +275,29 @@ typedef struct
     uint32_t dernier_essai;      // HAL_GetTick() du dernier essai de lecture
     uint8_t  horodatage_valide;  // 1 si la RTC a répondu (nécessaire pour nommer le fichier)
     bool     incoherent;         // une valeur hors seuils a été rejetée
-    bool     bme280_termine;     // réponse reçue ou TIMEOUT atteint
-    bool     lumiere_termine;
-    bool     gps_termine;
+    bool     gps_termine;        // réponse reçue ou TIMEOUT atteint (pour les capteurs : capteurs[k].termine)
 } acquisition_t;
 
 static acquisition_t acq = {0};
 
-static moyenne_t moy_temperature;
-static moyenne_t moy_humidite;
-static moyenne_t moy_pression;
-static moyenne_t moy_luminosite;
+// Tableau des capteurs (description fixe, état initialisé à zéro : valeurs NA, aucun timeout)
+static capteur_t capteurs[NB_CAPTEURS] =
+{
+    [CAPT_TEMPERATURE] = { .nom = "TEMP_AIR", .libelle = "T", .unite = " C",   .decimales = 1U,
+                           .source = SOURCE_BME280,  .actif = &params.temp_air,
+                           .seuil_min = &params.min_temp_air, .seuil_max = &params.max_temp_air },
+
+    [CAPT_HUMIDITE]    = { .nom = "HYGR",     .libelle = "H", .unite = " %",   .decimales = 1U,
+                           .source = SOURCE_BME280,  .actif = &params.hygr,
+                           .temp_min = &params.hygr_mint, .temp_max = &params.hygr_maxt },
+
+    [CAPT_PRESSION]    = { .nom = "PRESSURE", .libelle = "P", .unite = " hPa", .decimales = 1U,
+                           .source = SOURCE_BME280,  .actif = &params.pressure,
+                           .seuil_min = &params.pressure_min, .seuil_max = &params.pressure_max },
+
+    [CAPT_LUMINOSITE]  = { .nom = "LUMIN",    .libelle = "L", .unite = "",     .decimales = 0U,
+                           .source = SOURCE_LUMIERE, .actif = &params.lumin }
+};
 
 // Délai d'inactivité du mode configuration
 static uint32_t config_derniere_activite = 0U;
@@ -289,12 +325,12 @@ static void    mettre_a_jour_led(void);             // erreur prioritaire en cli
 static void    acquisition_demarrer(uint8_t lire_gps);  // lance une acquisition (RTC lue tout de suite)
 static bool    acquisition_continuer(void);         // un essai par capteur en attente ; true quand tout est terminé
 static void    acquisition_annuler(void);           // changement de mode pendant une acquisition
-static void    resultat_bme280(const Env_Data *env);       // env = 0 : TIMEOUT atteint
-static void    resultat_lumiere(bool reponse, uint16_t valeur);
+static bool    lire_capteur(capteur_id_t k, bool *bme280_lu, Env_Data *env, float *valeur, bool timeout_atteint);
+static void    traiter_resultat(capteur_t *c, bool reponse, float valeur, float temperature);
 static void    resultat_gps(bool reponse, const GPS_Data *gps);
 static void    terminer_acquisition(void);          // moyennes, erreurs capteur / GPS / incohérence
 static void    afficher_mesures(void);              // affichage série des mesures (mode maintenance)
-static void    compter_reponse(capteur_t capteur, bool reponse);
+static void    compter_reponse(capteur_t *c, bool reponse);
 static float   moyenne_ajouter(moyenne_t *m, float valeur);
 static void    moyenne_vider(moyenne_t *m);
 static void    reinitialiser_moyennes(void);
@@ -307,6 +343,7 @@ static void    effacer_erreur(code_erreur_t code);  // efface le bit de l'erreur
 static void    enregistrer_sd(void);                // ligne de mesure, changement de date, archivage, écriture
 static void    construire_nom_fichier(char *nom, size_t taille, const RTC_DateTime *dt, uint8_t revision);
 static void    construire_ligne(char *ligne, size_t taille);
+static void    construire_entete(char *entete, size_t taille);
 static void    ajouter_champ(char *ligne, size_t taille, bool ok, double valeur, uint8_t decimales);
 static uint8_t revision_suivante(const RTC_DateTime *dt);
 static SDResultat archiver(const RTC_DateTime *dt);
@@ -462,10 +499,10 @@ static void moyenne_vider(moyenne_t *m)
 
 static void reinitialiser_moyennes(void)
 {
-    moyenne_vider(&moy_temperature);
-    moyenne_vider(&moy_humidite);
-    moyenne_vider(&moy_pression);
-    moyenne_vider(&moy_luminosite);
+    for (uint8_t k = 0U; k < NB_CAPTEURS; k++)
+    {
+        moyenne_vider(&capteurs[k].moyenne);
+    }
 }
 
 // GESTION DES ERREURS
@@ -481,15 +518,15 @@ static void effacer_erreur(code_erreur_t code)
 }
 
 // Met à jour le compteur de timeouts consécutifs d'un capteur
-static void compter_reponse(capteur_t capteur, bool reponse)
+static void compter_reponse(capteur_t *c, bool reponse)
 {
     if (reponse)
     {
-        nb_timeouts[capteur] = 0U;
+        c->nb_timeouts = 0U;
     }
-    else if (nb_timeouts[capteur] < UINT8_MAX)
+    else if (c->nb_timeouts < UINT8_MAX)
     {
-        nb_timeouts[capteur]++;
+        c->nb_timeouts++;
     }
 }
 
@@ -504,12 +541,17 @@ static void compter_reponse(capteur_t capteur, bool reponse)
 
 static void acquisition_demarrer(uint8_t lire_gps)
 {
-    // Toutes les valeurs à NA par défaut
-    mesures.temperature_ok = false;
-    mesures.humidite_ok    = false;
-    mesures.pression_ok    = false;
-    mesures.luminosite_ok  = false;
-    mesures.gps_ok         = false;
+    // Toutes les valeurs à NA par défaut ; un capteur désactivé est considéré comme terminé (pas lu, pas d'erreur)
+    for (uint8_t k = 0U; k < NB_CAPTEURS; k++)
+    {
+        capteur_t *c = &capteurs[k];
+
+        c->ok      = false;
+        c->termine = (*c->actif == 0);
+
+        if (c->termine) c->nb_timeouts = 0U;
+    }
+    mesures.gps_ok = false;
 
     acq.en_cours      = true;
     acq.debut         = HAL_GetTick();
@@ -524,15 +566,7 @@ static void acquisition_demarrer(uint8_t lire_gps)
     else
         signaler_erreur(ERR_RTC);
 
-    // Un capteur désactivé est considéré comme terminé (pas lu, pas d'erreur)
-    acq.bme280_termine  = !(params.temp_air || params.hygr || params.pressure);
-    acq.lumiere_termine = !params.lumin;
-    acq.gps_termine     = !lire_gps;
-
-    if (!params.temp_air) nb_timeouts[CAPT_TEMPERATURE] = 0U;
-    if (!params.hygr)     nb_timeouts[CAPT_HUMIDITE]    = 0U;
-    if (!params.pressure) nb_timeouts[CAPT_PRESSION]    = 0U;
-    if (!params.lumin)    nb_timeouts[CAPT_LUMINOSITE]  = 0U;
+    acq.gps_termine = !lire_gps;
 }
 
 static bool acquisition_continuer(void)
@@ -549,37 +583,29 @@ static bool acquisition_continuer(void)
 
     bool timeout_atteint = (maintenant - acq.debut) >= (uint32_t)params.timeout * 1000U;
 
-    // BME280 : une seule lecture fournit température, humidité et pression
-    if (!acq.bme280_termine)
-    {
-        Env_Data env;
+    // Un essai pour chaque capteur encore en attente
+    bool     bme280_lu = false; // le BME280 n'est lu qu'une fois par essai pour ses trois capteurs
+    Env_Data env = {0};
+    bool     tous_termines = true;
 
-        if (GroveBME280_ReadEnvironment(&env))
-        {
-            resultat_bme280(&env);
-            acq.bme280_termine = true;
-        }
-        else if (timeout_atteint)
-        {
-            resultat_bme280(0);
-            acq.bme280_termine = true;
-        }
-        else
-        {
-            (void)GroveBME280_Init(); // capteur rebranché : réinitialisation avant le prochain essai
-        }
-    }
-
-    // Luminosité (0-1023)
-    if (!acq.lumiere_termine)
+    for (uint8_t k = 0U; k < NB_CAPTEURS; k++)
     {
-        uint16_t lumiere = GroveLight_ReadRaw(); // 0-1023 (ADC 10 bits)
-        bool reponse = (lumiere != LUMIN_ERREUR) && GroveLight_EstConnecte();
+        capteur_t *c = &capteurs[k];
+
+        if (c->termine) continue;
+
+        float valeur = 0.0f;
+        bool reponse = lire_capteur((capteur_id_t)k, &bme280_lu, &env, &valeur, timeout_atteint);
 
         if (reponse || timeout_atteint)
         {
-            resultat_lumiere(reponse, lumiere);
-            acq.lumiere_termine = true;
+            // La plage de température (HYGR_MINT / HYGR_MAXT) s'applique à la température mesurée en même temps
+            traiter_resultat(c, reponse, valeur, env.temperature_c);
+            c->termine = true;
+        }
+        else
+        {
+            tous_termines = false;
         }
     }
 
@@ -596,7 +622,7 @@ static bool acquisition_continuer(void)
         }
     }
 
-    if (acq.bme280_termine && acq.lumiere_termine && acq.gps_termine)
+    if (tous_termines && acq.gps_termine)
     {
         terminer_acquisition();
         return true;
@@ -610,71 +636,74 @@ static void acquisition_annuler(void)
     acq.en_cours = false;
 }
 
-// Résultat du BME280 (env = 0 : aucune réponse avant TIMEOUT)
-static void resultat_bme280(const Env_Data *env)
+// Lecture d'un capteur. Retourne true si le capteur a répondu (valeur dans *valeur).
+// Le BME280 n'est interrogé qu'une fois par essai : *bme280_lu et *env mémorisent sa réponse.
+static bool lire_capteur(capteur_id_t k, bool *bme280_lu, Env_Data *env, float *valeur, bool timeout_atteint)
 {
-    bool reponse = (env != 0);
+    static bool bme280_repond = false;
 
-    // Température
-    if (params.temp_air)
+    switch (capteurs[k].source)
     {
-        compter_reponse(CAPT_TEMPERATURE, reponse);
+        case SOURCE_BME280:
+            if (!*bme280_lu)
+            {
+                *bme280_lu = true;
+                bme280_repond = GroveBME280_ReadEnvironment(env);
 
-        if (reponse)
+                if (!bme280_repond && !timeout_atteint)
+                {
+                    (void)GroveBME280_Init(); // capteur rebranché : réinitialisation avant le prochain essai
+                }
+            }
+
+            if (!bme280_repond) return false;
+
+            if      (k == CAPT_TEMPERATURE) *valeur = env->temperature_c;
+            else if (k == CAPT_HUMIDITE)    *valeur = env->humidity_percent;
+            else                            *valeur = env->pressure_hpa;
+            return true;
+
+        case SOURCE_LUMIERE:
         {
-            if (env->temperature_c < params.min_temp_air || env->temperature_c > params.max_temp_air)
-            {
-                acq.incoherent = true; // valeur rejetée (reste NA)
-            }
-            else
-            {
-                mesures.temperature_c  = moyenne_ajouter(&moy_temperature, env->temperature_c);
-                mesures.temperature_ok = true;
-            }
+            uint16_t lumiere = GroveLight_ReadRaw(); // 0-1023 (ADC 10 bits)
+            *valeur = (float)lumiere;
+            return (lumiere != LUMIN_ERREUR) && GroveLight_EstConnecte();
         }
-    }
 
-    // Humidité : ignorée si la température sort de [HYGR_MINT ; HYGR_MAXT]
-    if (params.hygr)
-    {
-        compter_reponse(CAPT_HUMIDITE, reponse);
-
-        if (reponse && env->temperature_c >= params.hygr_mint && env->temperature_c <= params.hygr_maxt)
-        {
-            mesures.humidite_pct = moyenne_ajouter(&moy_humidite, env->humidity_percent);
-            mesures.humidite_ok  = true;
-        }
-    }
-
-    // Pression
-    if (params.pressure)
-    {
-        compter_reponse(CAPT_PRESSION, reponse);
-
-        if (reponse)
-        {
-            if (env->pressure_hpa < params.pressure_min || env->pressure_hpa > params.pressure_max)
-            {
-                acq.incoherent = true;
-            }
-            else
-            {
-                mesures.pression_hpa = moyenne_ajouter(&moy_pression, env->pressure_hpa);
-                mesures.pression_ok  = true;
-            }
-        }
+        default:
+            return false;
     }
 }
 
-static void resultat_lumiere(bool reponse, uint16_t valeur)
+// Traitement commun à tous les capteurs : compteur de timeouts, contrôles, moyenne glissante
+static void traiter_resultat(capteur_t *c, bool reponse, float valeur, float temperature)
 {
-    compter_reponse(CAPT_LUMINOSITE, reponse);
+    compter_reponse(c, reponse);
 
-    if (reponse)
+    if (!reponse) return; // abandon après TIMEOUT : reste NA
+
+    // Seuils de cohérence (MIN_TEMP_AIR / MAX_TEMP_AIR, PRESSURE_MIN / PRESSURE_MAX)
+    if (c->seuil_min != 0 && (valeur < *c->seuil_min || valeur > *c->seuil_max))
     {
-        mesures.luminosite    = (uint16_t)(moyenne_ajouter(&moy_luminosite, (float)valeur) + 0.5f);
-        mesures.luminosite_ok = true;
+        acq.incoherent = true; // valeur rejetée : reste NA
+        return;
     }
+
+    // Plage de température requise (HYGR_MINT / HYGR_MAXT) : hors plage, valeur ignorée sans erreur
+    if (c->temp_min != 0 && (temperature < *c->temp_min || temperature > *c->temp_max))
+    {
+        return;
+    }
+
+    float moyenne = moyenne_ajouter(&c->moyenne, valeur);
+
+    if (c->decimales == 0U)
+    {
+        moyenne = (float)(int32_t)(moyenne + 0.5f); // arrondi à l'entier (luminosité)
+    }
+
+    c->valeur = moyenne;
+    c->ok     = true;
 }
 
 static void resultat_gps(bool reponse, const GPS_Data *gps)
@@ -705,21 +734,17 @@ static void terminer_acquisition(void)
 {
     acq.en_cours = false;
 
-    // Mesure NA : historique interrompu, la moyenne repart de zéro
-    if (!mesures.temperature_ok) moyenne_vider(&moy_temperature);
-    if (!mesures.humidite_ok)    moyenne_vider(&moy_humidite);
-    if (!mesures.pression_ok)    moyenne_vider(&moy_pression);
-    if (!mesures.luminosite_ok)  moyenne_vider(&moy_luminosite);
-
-    // Erreur capteur : au moins un capteur abandonné NB_TIMEOUTS_ERREUR fois de suite
     bool erreur_capteur = false;
 
-    for (uint8_t i = 0U; i < NB_CAPTEURS; i++)
+    for (uint8_t k = 0U; k < NB_CAPTEURS; k++)
     {
-        if (nb_timeouts[i] >= NB_TIMEOUTS_ERREUR)
-        {
-            erreur_capteur = true;
-        }
+        capteur_t *c = &capteurs[k];
+
+        // Mesure NA : historique interrompu, la moyenne repart de zéro
+        if (!c->ok) moyenne_vider(&c->moyenne);
+
+        // Erreur capteur : au moins un capteur abandonné NB_TIMEOUTS_ERREUR fois de suite
+        if (c->nb_timeouts >= NB_TIMEOUTS_ERREUR) erreur_capteur = true;
     }
 
     if (erreur_capteur)
@@ -742,17 +767,13 @@ static void afficher_mesures(void)
            mesures.horodatage.day, mesures.horodatage.month, mesures.horodatage.year,
            mesures.horodatage.hours, mesures.horodatage.minutes, mesures.horodatage.seconds);
 
-    if (mesures.temperature_ok) printf("T=%.1f C | ", mesures.temperature_c);
-    else                        printf("T=" VALEUR_NA " | ");
+    for (uint8_t k = 0U; k < NB_CAPTEURS; k++)
+    {
+        const capteur_t *c = &capteurs[k];
 
-    if (mesures.humidite_ok)    printf("H=%.1f %% | ", mesures.humidite_pct);
-    else                        printf("H=" VALEUR_NA " | ");
-
-    if (mesures.pression_ok)    printf("P=%.1f hPa | ", mesures.pression_hpa);
-    else                        printf("P=" VALEUR_NA " | ");
-
-    if (mesures.luminosite_ok)  printf("L=%u | ", mesures.luminosite);
-    else                        printf("L=" VALEUR_NA " | ");
+        if (c->ok) printf("%s=%.*f%s | ", c->libelle, c->decimales, (double)c->valeur, c->unite);
+        else       printf("%s=" VALEUR_NA " | ", c->libelle);
+    }
 
     if (mesures.gps_ok)         printf("GPS=%.6f,%.6f", mesures.latitude, mesures.longitude);
     else                        printf("GPS=" VALEUR_NA);
@@ -780,19 +801,35 @@ static void ajouter_champ(char *ligne, size_t taille, bool ok, double valeur, ui
         snprintf(&ligne[n], taille - n, ";" VALEUR_NA);
 }
 
-// Ligne de mesure : JJ/MM/AAAA HH:MM:SS;T;H;P;L;LAT;LON
+// Ligne de mesure : JJ/MM/AAAA HH:MM:SS;<valeur de chaque capteur>;LAT;LON
 static void construire_ligne(char *ligne, size_t taille)
 {
     snprintf(ligne, taille, "%02u/%02u/%04u %02u:%02u:%02u",
              mesures.horodatage.day, mesures.horodatage.month, mesures.horodatage.year,
              mesures.horodatage.hours, mesures.horodatage.minutes, mesures.horodatage.seconds);
 
-    ajouter_champ(ligne, taille, mesures.temperature_ok, mesures.temperature_c, 1U);
-    ajouter_champ(ligne, taille, mesures.humidite_ok,    mesures.humidite_pct,  1U);
-    ajouter_champ(ligne, taille, mesures.pression_ok,    mesures.pression_hpa,  1U);
-    ajouter_champ(ligne, taille, mesures.luminosite_ok,  mesures.luminosite,    0U);
-    ajouter_champ(ligne, taille, mesures.gps_ok,         mesures.latitude,      6U);
-    ajouter_champ(ligne, taille, mesures.gps_ok,         mesures.longitude,     6U);
+    for (uint8_t k = 0U; k < NB_CAPTEURS; k++)
+    {
+        ajouter_champ(ligne, taille, capteurs[k].ok, capteurs[k].valeur, capteurs[k].decimales);
+    }
+
+    ajouter_champ(ligne, taille, mesures.gps_ok, mesures.latitude,  6U);
+    ajouter_champ(ligne, taille, mesures.gps_ok, mesures.longitude, 6U);
+}
+
+// En-tête : DATE;<nom de chaque capteur>;LATITUDE;LONGITUDE
+static void construire_entete(char *entete, size_t taille)
+{
+    snprintf(entete, taille, "DATE");
+
+    for (uint8_t k = 0U; k < NB_CAPTEURS; k++)
+    {
+        size_t n = strlen(entete);
+        snprintf(&entete[n], taille - n, ";%s", capteurs[k].nom);
+    }
+
+    size_t n = strlen(entete);
+    snprintf(&entete[n], taille - n, ";LATITUDE;LONGITUDE");
 }
 
 // Première révision libre du jour (1 à REVISION_MAX), 0 si toutes sont prises
@@ -855,7 +892,9 @@ static void enregistrer_sd(void)
     // Nouveau fichier : ligne d'en-tête
     if (res == SD_OK && taille < 0)
     {
-        res = SDLogger_AjouterLigne(nom, ENTETE_LOG);
+        char entete[TAILLE_LIGNE];
+        construire_entete(entete, sizeof(entete));
+        res = SDLogger_AjouterLigne(nom, entete);
     }
 
     if (res == SD_OK)
