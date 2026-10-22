@@ -16,7 +16,7 @@
 
 // RÉGLAGES DÉMONSTRATION / VERSION FINALE
 
-#ifndef MODE_DEMO      // peut être imposé à la compilation : ./build.sh -r  (=> -DMODE_DEMO=0)
+#ifndef MODE_DEMO      // peut être imposé à la compilation : ./build.sh rendu  (=> -DMODE_DEMO=0)
     #define MODE_DEMO  1   // 1 : délais courts pour la soutenance  |  0 : valeurs du cahier des charges (rendu)
 #endif
 
@@ -148,8 +148,8 @@ typedef struct
     uint8_t nombre;     // nombre de valeurs présentes (< TAILLE_MOYENNE au démarrage)
 } moyenne_t;
 
-// UN CAPTEUR (prosit « Un peu de structure ») : sa description et toutes ses données regroupées,
-// pour traiter les capteurs par une boucle sur le tableau au lieu d'un bloc de code par capteur.
+// UN CAPTEUR : sa description et toutes ses données regroupées,
+// pour traiter les capteurs par une boucle sur le tableau au lieu d'un bloc de code par capteur
 
 typedef struct
 {
@@ -204,7 +204,7 @@ typedef struct
     int32_t     max;
 } param_config_t;
 
-// MESURES (dernière acquisition ; un champ *_ok à false = valeur NA)
+// MESURES (dernière acquisition , un champ *_ok à false = valeur NA)
 
 typedef struct
 {
@@ -577,11 +577,11 @@ static bool acquisition_continuer(void)
 
     if ((maintenant - acq.dernier_essai) < PERIODE_ESSAI_MS)
     {
-        return false; // pas encore l'heure du prochain essai
+        return false; // intervalle entre acquisitions depuis la dernière pas encore atteint, attente
     }
-    acq.dernier_essai = maintenant;
+    acq.dernier_essai = maintenant; // nouveau tour de boucle : un essai pour chaque capteur encore en attente
 
-    bool timeout_atteint = (maintenant - acq.debut) >= (uint32_t)params.timeout * 1000U;
+    bool timeout_atteint = (maintenant - acq.debut) >= (uint32_t)params.timeout * 1000U; // capteur abandonné après TIMEOUT secondes sans réponse
 
     // Un essai pour chaque capteur encore en attente
     bool     bme280_lu = false; // le BME280 n'est lu qu'une fois par essai pour ses trois capteurs
