@@ -9,6 +9,11 @@
 
 set -e   # arrêt à la première erreur
 
+# pio est dans le PATH si PlatformIO Core est installé ; sinon on prend celui de l'extension VS Code
+if ! command -v pio > /dev/null 2>&1; then
+    export PATH="$HOME/.platformio/penv/bin:$PATH"
+fi
+
 # Choix de la version : MODE_DEMO est transmis au compilateur (-D), sans modifier main.c
 if [ "$1" = "rendu" ]; then
     export PLATFORMIO_BUILD_FLAGS="-DMODE_DEMO=0"
